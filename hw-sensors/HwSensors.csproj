@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>HwSensors</RootNamespace>
+    <AssemblyName>HwSensors</AssemblyName>
+    <Platforms>x86;x64;ARM64</Platforms>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>false</WinUISDKReferences>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>false</EnableMsixTooling>
+
+    <!-- 自带 LibreHardwareMonitor 等第三方依赖，必须开 -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+
+    <WinIslandPluginsDir Condition="'$(WinIslandPluginsDir)' == ''">$(LocalAppData)\Programs\WinIsland\plugins</WinIslandPluginsDir>
+    <PluginTargetDir>$(WinIslandPluginsDir)\hw-sensors</PluginTargetDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 插件 SDK：主次版本 = 宿主 API 版本（宿主 WinIsland.Core.dll = 2.4.0） -->
+    <PackageReference Include="luolan.winland.Core" Version="2.4.0" PrivateAssets="all" ExcludeAssets="runtime" />
+
+    <!-- WinAppSDK / WinUI 运行时由宿主提供，排除出运行时 -->
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2526" PrivateAssets="all" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" PrivateAssets="all" ExcludeAssets="runtime" />
+
+    <!-- 硬件传感器库（MPL-2.0） -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="plugin.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="README.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- 构建后：把插件文件拷进宿主 plugins\hw-sensors\（宿主自带运行时文件不拷） -->
+  <!-- 宿主正在运行时会锁住插件 dll，需要先关掉宿主：deploy.ps1 会自己处理 -->
+  <Target Name="CopyToWinIsland" AfterTargets="Build" Condition="'$(SkipDeploy)' != 'true'">
+    <ItemGroup>
+      <PluginArtifacts Include="$(OutDir)**\*.*" />
+      <PluginArtifacts Remove="$(OutDir)WinIsland.Core.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.WinUI.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Windows.SDK.NET.dll" />
+      <PluginArtifacts Remove="$(OutDir)WinRT.Runtime.dll" />
+      <!-- 宿主已自带 System.Management（10.0.0.0），不要重复分发 -->
+      <PluginArtifacts Remove="$(OutDir)System.Management.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Windows.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Web.WebView2*.dll" />
+      <PluginArtifacts Remove="$(OutDir)WebView2Loader.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Graphics.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.InteractiveExperiences.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.*.Projection.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.WindowsAppRuntime*" />
+      <PluginArtifacts Remove="$(OutDir)**\*.pdb" />
+    </ItemGroup>
+    <MakeDir Directories="$(PluginTargetDir)" />
+    <Copy
+      SourceFiles="@(PluginArtifacts)"
+      DestinationFiles="@(PluginArtifacts->'$(PluginTargetDir)\%(RecursiveDir)%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

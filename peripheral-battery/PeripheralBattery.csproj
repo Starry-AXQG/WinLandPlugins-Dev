@@ -1,0 +1,66 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>PeripheralBattery</RootNamespace>
+    <AssemblyName>PeripheralBattery</AssemblyName>
+    <Platforms>x86;x64;ARM64</Platforms>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>false</WinUISDKReferences>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+
+    <WinIslandPluginsDir Condition="'$(WinIslandPluginsDir)' == ''">$(LocalAppData)\Programs\WinIsland\plugins</WinIslandPluginsDir>
+    <PluginTargetDir>$(WinIslandPluginsDir)\peripheral-battery</PluginTargetDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="luolan.winland.Core" Version="2.4.0" PrivateAssets="all" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2526" PrivateAssets="all" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" PrivateAssets="all" ExcludeAssets="runtime" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="plugin.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="README.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- docs/ 只是 README 用的截图，logo.png 只给市场用：都不参与构建，也不能被打进 .lwp -->
+  <ItemGroup>
+    <Content Remove="docs\**" />
+    <None Remove="docs\**" />
+    <None Include="docs\**" CopyToOutputDirectory="Never" />
+    <Content Remove="logo.png" />
+    <None Remove="logo.png" />
+    <None Include="logo.png" CopyToOutputDirectory="Never" />
+  </ItemGroup>
+
+  <Target Name="CopyToWinIsland" AfterTargets="Build">
+    <ItemGroup>
+      <PluginArtifacts Include="$(OutDir)**\*.*" />
+      <PluginArtifacts Remove="$(OutDir)WinIsland.Core.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.WinUI.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Windows.SDK.NET.dll" />
+      <PluginArtifacts Remove="$(OutDir)WinRT.Runtime.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Windows.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Web.WebView2*.dll" />
+      <PluginArtifacts Remove="$(OutDir)WebView2Loader.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Graphics.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.InteractiveExperiences.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.*.Projection.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.WindowsAppRuntime*" />
+      <PluginArtifacts Remove="$(OutDir)**\*.pdb" />
+    </ItemGroup>
+    <MakeDir Directories="$(PluginTargetDir)" />
+    <Copy
+      SourceFiles="@(PluginArtifacts)"
+      DestinationFiles="@(PluginArtifacts->'$(PluginTargetDir)\%(RecursiveDir)%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

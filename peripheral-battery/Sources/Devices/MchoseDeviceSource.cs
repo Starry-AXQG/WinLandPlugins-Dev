@@ -48,6 +48,13 @@ internal sealed class MchoseDeviceSource : IDeviceSource
 
     private static readonly TimeSpan StaleAfter = TimeSpan.FromMinutes(30);
 
+    /// <summary>
+    /// 按接收器 (VID, PID) 缓存最近一次唤醒态直读到的有效电量，
+    /// 避免无线键盘静止进入省电休眠（返回 stopCommunication FA FB 06 00）时从灵动岛列表消失。
+    /// 当接收器被拔出时会自动清理对应条目。
+    /// </summary>
+    private readonly Dictionary<(int Vid, int Pid), DeviceBattery> _lastKnownByProduct = new();
+
     public string Brand => "MCHOSE";
 
     public List<DeviceBattery> Collect(DeviceSourceContext context)
@@ -80,6 +87,13 @@ internal sealed class MchoseDeviceSource : IDeviceSource
 
         context.Debug($"{Brand}：HID 共 {all.Count} 条，GLW 通道（0001:0000）命中 {candidates.Count} 条");
 
+        // 清理已拔出接收器的休眠缓存
+        var presentProducts = candidates.Select(h => ((int)h.VendorId, (int)h.ProductId)).ToHashSet();
+        foreach (var cachedKey in _lastKnownByProduct.Keys.Where(k => !presentProducts.Contains(k)).ToList())
+        {
+            _lastKnownByProduct.Remove(cachedKey);
+        }
+
         foreach (var hid in candidates)
         {
             var key = ((int)hid.VendorId, (int)hid.ProductId);
@@ -98,13 +112,29 @@ internal sealed class MchoseDeviceSource : IDeviceSource
 
             if (resp is null)
             {
-                context.Debug($"{Brand}：GLW getFuncConfig 无响应（{hid.VendorId:X4}:{hid.ProductId:X4}）");
+                if (_lastKnownByProduct.TryGetValue(key, out var cachedOnTimeout))
+                {
+                    context.Debug($"{Brand}：GLW getFuncConfig 偶发超时，沿用最近一次已知电量={cachedOnTimeout.Level}%");
+                    result.Add(cachedOnTimeout);
+                }
+                else
+                {
+                    context.Debug($"{Brand}：GLW getFuncConfig 无响应（{hid.VendorId:X4}:{hid.ProductId:X4}）");
+                }
                 continue;
             }
 
             if (IsGlwStopFrame(resp))
             {
-                context.Debug($"{Brand}：键盘当前处于休眠/离线状态（stopCommunication FA FB 06 00）");
+                if (_lastKnownByProduct.TryGetValue(key, out var cachedOnSleep))
+                {
+                    context.Debug($"{Brand}：键盘处于省电休眠（FA FB 06 00），保持休眠前电量={cachedOnSleep.Level}%");
+                    result.Add(cachedOnSleep);
+                }
+                else
+                {
+                    context.Debug($"{Brand}：键盘当前处于休眠或未开机状态（stopCommunication FA FB 06 00，尚无历史电量快照）");
+                }
                 continue;
             }
 
@@ -118,7 +148,15 @@ internal sealed class MchoseDeviceSource : IDeviceSource
 
             if (level <= 0 || level > 100)
             {
-                context.Debug($"{Brand}：GLW 返回电量无效 raw=0x{rawBattery:X2} (level={level})");
+                if (_lastKnownByProduct.TryGetValue(key, out var cachedOnInvalid))
+                {
+                    context.Debug($"{Brand}：GLW 返回电量瞬态无效 raw=0x{rawBattery:X2}，沿用最近一次已知电量={cachedOnInvalid.Level}%");
+                    result.Add(cachedOnInvalid);
+                }
+                else
+                {
+                    context.Debug($"{Brand}：GLW 返回电量无效 raw=0x{rawBattery:X2} (level={level})");
+                }
                 continue;
             }
 
@@ -127,7 +165,7 @@ internal sealed class MchoseDeviceSource : IDeviceSource
 
             context.Debug($"{Brand}：{cleanName} 直读成功，电量={level}%，充电={(charging ? "是" : "否")}，workMode={workMode}");
 
-            result.Add(new DeviceBattery
+            var entry = new DeviceBattery
             {
                 Id = $"mchose:{hid.VendorId}:{hid.ProductId}:{cleanName}",
                 Name = cleanName,
@@ -139,7 +177,10 @@ internal sealed class MchoseDeviceSource : IDeviceSource
                 Link = workMode == 1 ? PeripheralLink.Wired : PeripheralLink.Usb24G,
                 Source = "HID 直读",
                 Stale = false,
-            });
+            };
+
+            _lastKnownByProduct[key] = entry;
+            result.Add(entry);
         }
     }
 

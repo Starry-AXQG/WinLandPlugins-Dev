@@ -23,7 +23,10 @@ namespace PeripheralBattery.Devices;
 ///   · <c>tx[16] = checkSum</c>，满足 <c>(0x08 + sum(tx[1..16])) &amp; 0xFF == 0x55</c>
 ///
 /// 读取流程：
-///   1. 发送 <c>cmd = 0x03</c>（GetWirelessMouseOnline）：若响应 <c>rx[6] != 1</c>，说明鼠标休眠或关机，跳过不显示。
+///   1. 发送 <c>cmd = 0x03</c>（GetWirelessMouseOnline）：
+///      - COMPX 无线鼠标静止数十秒后会进入一级省电休眠，此时接收器返回 <c>rx[6] == 0</c>（<c>onlineStatus = 0</c>）。
+///      - 若接收器仍在 USB 口上且此前已读到过有效电量，则在鼠标休眠期间沿用休眠前的最后一次电量，防止鼠标一静止就从灵动岛列表消失；
+///      - 若接收器被物理拔出，则立即清除缓存并从列表移除。
 ///   2. 发送 <c>cmd = 0x04</c>（GetBatteryLevel）：
 ///      - <c>rx[6]</c> = 电量百分比（0..100）
 ///      - <c>rx[7]</c> = 充电状态（1 = 充电中，0 = 未充电）
@@ -40,6 +43,13 @@ internal sealed class VxeDeviceSource : IDeviceSource
 
     private const byte CmdGetWirelessMouseOnline = 0x03;
     private const byte CmdGetBatteryLevel = 0x04;
+
+    /// <summary>
+    /// 按接收器 (VID, PID) 缓存最近一次唤醒态读到的有效电量，
+    /// 避免鼠标静止几十秒进入一级省电休眠（onlineStatus=0）时频繁从灵动岛列表消失。
+    /// 当接收器被拔出时会自动清理对应条目。
+    /// </summary>
+    private readonly Dictionary<(ushort Vid, ushort Pid), DeviceBattery> _lastKnownByProduct = new();
 
     public string Brand => "VXE";
 
@@ -58,13 +68,21 @@ internal sealed class VxeDeviceSource : IDeviceSource
 
         context.Debug($"{Brand}：HID 共 {all.Count} 条，COMPX 通道（FF02:0002）命中 {candidates.Count} 条");
 
+        // 清理已拔出接收器的休眠缓存
+        var presentProducts = candidates.Select(h => (h.VendorId, h.ProductId)).ToHashSet();
+        foreach (var cachedKey in _lastKnownByProduct.Keys.Where(k => !presentProducts.Contains(k)).ToList())
+        {
+            _lastKnownByProduct.Remove(cachedKey);
+        }
+
         var seenProducts = new HashSet<(ushort Vid, ushort Pid)>();
 
         foreach (var hid in candidates)
         {
-            if (seenProducts.Contains((hid.VendorId, hid.ProductId))) continue;
+            var productKey = (hid.VendorId, hid.ProductId);
+            if (seenProducts.Contains(productKey)) continue;
 
-            // 1. 先检查无线鼠标是否在线（开机且未深度断连）
+            // 1. 先检查无线鼠标是否处于唤醒在线态
             var onlineReq = BuildCompxPacket(CmdGetWirelessMouseOnline);
             var onlineResp = Native.HidNative.Transact(
                 hid.Path,
@@ -75,14 +93,32 @@ internal sealed class VxeDeviceSource : IDeviceSource
 
             if (onlineResp is null || onlineResp[2] != 0x00)
             {
-                context.Debug($"{Brand}：在线状态查询无响应（{hid.VendorId:X4}:{hid.ProductId:X4}）");
+                if (_lastKnownByProduct.TryGetValue(productKey, out var cachedOnTimeout))
+                {
+                    context.Debug($"{Brand}：在线查询超时，沿用最近一次已知电量={cachedOnTimeout.Level}%");
+                    result.Add(cachedOnTimeout);
+                    seenProducts.Add(productKey);
+                }
+                else
+                {
+                    context.Debug($"{Brand}：在线状态查询无响应（{hid.VendorId:X4}:{hid.ProductId:X4}）");
+                }
                 continue;
             }
 
             var isOnline = onlineResp[6] == 1;
             if (!isOnline)
             {
-                context.Debug($"{Brand}：无线鼠标当前离线或休眠（onlineStatus={onlineResp[6]}）");
+                if (_lastKnownByProduct.TryGetValue(productKey, out var cachedOnSleep))
+                {
+                    context.Debug($"{Brand}：无线鼠标处于省电休眠（onlineStatus={onlineResp[6]}），保持休眠前电量={cachedOnSleep.Level}%");
+                    result.Add(cachedOnSleep);
+                    seenProducts.Add(productKey);
+                }
+                else
+                {
+                    context.Debug($"{Brand}：无线鼠标当前休眠或未开机（onlineStatus={onlineResp[6]}，尚无历史电量快照）");
+                }
                 continue;
             }
 
@@ -97,7 +133,16 @@ internal sealed class VxeDeviceSource : IDeviceSource
 
             if (batteryResp is null || batteryResp[2] != 0x00)
             {
-                context.Debug($"{Brand}：电量查询无响应或状态失败（{hid.VendorId:X4}:{hid.ProductId:X4}）");
+                if (_lastKnownByProduct.TryGetValue(productKey, out var cachedOnBatFail))
+                {
+                    context.Debug($"{Brand}：电量查询偶发未响应，沿用最近一次已知电量={cachedOnBatFail.Level}%");
+                    result.Add(cachedOnBatFail);
+                    seenProducts.Add(productKey);
+                }
+                else
+                {
+                    context.Debug($"{Brand}：电量查询无响应或状态失败（{hid.VendorId:X4}:{hid.ProductId:X4}）");
+                }
                 continue;
             }
 
@@ -107,7 +152,16 @@ internal sealed class VxeDeviceSource : IDeviceSource
 
             if (level <= 0 || level > 100)
             {
-                context.Debug($"{Brand}：返回电量无效 level={level}, voltage={voltageMv}mV");
+                if (_lastKnownByProduct.TryGetValue(productKey, out var cachedOnInvalid))
+                {
+                    context.Debug($"{Brand}：返回电量瞬态无效 level={level}，沿用最近一次已知电量={cachedOnInvalid.Level}%");
+                    result.Add(cachedOnInvalid);
+                    seenProducts.Add(productKey);
+                }
+                else
+                {
+                    context.Debug($"{Brand}：返回电量无效 level={level}, voltage={voltageMv}mV");
+                }
                 continue;
             }
 
@@ -115,7 +169,7 @@ internal sealed class VxeDeviceSource : IDeviceSource
 
             var name = string.IsNullOrWhiteSpace(hid.ProductName) ? "VXE 无线鼠标" : hid.ProductName;
 
-            result.Add(new DeviceBattery
+            var entry = new DeviceBattery
             {
                 Id = $"hid:{hid.VendorId:x4}:{hid.ProductId:x4}",
                 Name = name,
@@ -126,9 +180,11 @@ internal sealed class VxeDeviceSource : IDeviceSource
                     : PeripheralKind.Mouse,
                 Link = PeripheralLink.Usb24G,
                 Source = "HID 直读",
-            });
+            };
 
-            seenProducts.Add((hid.VendorId, hid.ProductId));
+            _lastKnownByProduct[productKey] = entry;
+            result.Add(entry);
+            seenProducts.Add(productKey);
         }
 
         return result;

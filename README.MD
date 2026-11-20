@@ -1,8 +1,8 @@
-这个项目存储着 WinLand 插件开发代码
+这个项目存储着 [WinIsland](https://github.com/luolangaga/WinLand) 插件开发代码
 
 根目录每一个文件夹都是一个独立的项目，包含全部源代码
 
-插件在这里管理代码，编译后产物提交到市场。
+插件在这里管理代码，编译后产物提交到[**插件市场**](https://github.com/luolangaga/WinLandPlugin)。
 
 ## 插件列表
 

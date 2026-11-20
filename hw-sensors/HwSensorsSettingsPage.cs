@@ -1,3 +1,5 @@
+using LibreHardwareMonitor.Hardware;
+using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using HwSensors.Sensors;
@@ -6,27 +8,64 @@ using WinIsland.Core;
 namespace HwSensors;
 
 /// <summary>
-/// 设置页：挑要监控哪些硬件。
-///
-/// 两个必须遵守的坑（SDK 文档 §15）：
-///   1. 动作按钮里先 CommitEditors() 再干活 —— 按钮点击早于 LostFocus，否则用的是旧值；
-///   2. 值没变就不写设置 —— 每次失焦都白触发一轮刷新。
-/// ComboBox 在构建页面时会触发一次 SelectionChanged，用 _loading 挡住，别把默认值写回去。
+/// 设置页：配置胶囊形态显示项（下拉选择硬件类别 + 多选子项）、主显卡、监控网卡与采样参数。
 /// </summary>
 internal sealed class HwSensorsSettingsPage
 {
+    private sealed record CapsuleItemDef(string Key, string Category, string Label, string ShortLabel);
+
+    private static readonly CapsuleItemDef[] AllCapsuleItems =
+    {
+        new("net.up",      "net",  "上传速度（↑）",  "上传"),
+        new("net.down",    "net",  "下载速度（↓）",  "下载"),
+        new("cpu.load",    "cpu",  "CPU 占用率",    "CPU占用"),
+        new("cpu.power",   "cpu",  "CPU 功耗",      "CPU功耗"),
+        new("cpu.temp",    "cpu",  "CPU 温度",      "CPU温度"),
+        new("gpu.load",    "gpu",  "GPU 占用率",    "GPU占用"),
+        new("gpu.power",   "gpu",  "GPU 功耗",      "GPU功耗"),
+        new("gpu.temp",    "gpu",  "GPU 温度",      "GPU温度"),
+        new("mem.load",    "mem",  "内存占用率",    "内存占用"),
+        new("mem.power",   "mem",  "内存功耗",      "内存功耗"),
+        new("mem.temp",    "mem",  "内存温度",      "内存温度"),
+        new("vram.load",   "vram", "显存占用率",    "显存占用"),
+        new("vram.temp",   "vram", "显存温度",      "显存温度"),
+        new("pwr.battery", "pwr",  "电池电量",      "电量"),
+        new("pwr.total",   "pwr",  "整机总功耗",    "总功耗"),
+    };
+
+    private static readonly (string Id, string Title)[] Categories =
+    {
+        ("net",  "网卡（默认：上传 + 下载）"),
+        ("cpu",  "CPU（处理器）"),
+        ("gpu",  "GPU（显卡）"),
+        ("mem",  "内存"),
+        ("vram", "显存"),
+        ("pwr",  "电源 / 电池"),
+        ("all",  "全部硬件（跨硬件自由组合）"),
+    };
+
     private readonly HwSensorsPlugin _plugin;
     private readonly ISettingsStore _settings;
 
     private bool _loading = true;
+    private readonly List<string> _selectedCapsuleKeys = new();
 
     private ToggleSwitch _enabled = null!;
-    private ToggleSwitch _cpu = null!;
-    private ToggleSwitch _gpu = null!;
-    private ToggleSwitch _total = null!;
-    private ToggleSwitch _battery = null!;
-    private ToggleSwitch _batteryHealth = null!;
+    private ToggleSwitch _capsuleFixedGrid = null!;
+    private ToggleSwitch _capsuleTwoRows = null!;
+    private ToggleSwitch _capsuleHideLabels = null!;
+    private NumberBox _capsuleFontSize = null!;
+    private NumberBox _capsulePadLeft = null!;
+    private NumberBox _capsulePadRight = null!;
+    private ComboBox _capsuleCategoryPicker = null!;
+    private StackPanel _capsuleCheckboxPanel = null!;
+    private TextBlock _capsuleSummary = null!;
+
     private ComboBox _gpuPicker = null!;
+    private readonly List<string> _gpuIds = new();
+    private ComboBox _nicPicker = null!;
+    private readonly List<string> _nicIds = new();
+
     private NumberBox _baseline = null!;
     private NumberBox _interval = null!;
     private TextBlock _status = null!;
@@ -50,7 +89,7 @@ internal sealed class HwSensorsSettingsPage
 
         panel.Children.Add(new TextBlock
         {
-            Text = "选择要在灵动岛上监控的硬件。关掉的项目不再采样，也不会占岛上的位置。",
+            Text = "胶囊形态支持自定义显示项并在过长时自动滚动；悬停卡片展示 6 项核心指标；点击岛体展开大卡片可查看全部多显卡与完整明细。",
             FontSize = 12,
             TextWrapping = TextWrapping.Wrap,
             Opacity = 0.75,
@@ -60,59 +99,200 @@ internal sealed class HwSensorsSettingsPage
         _enabled = MakeToggle("在灵动岛上显示", HwSensorsPlugin.KEnabled, true);
         panel.Children.Add(Card(_enabled));
 
-        // ---- 监控项 ----
-        _cpu = MakeToggle("CPU 温度 / 功耗 / 占用", HwSensorsPlugin.KCpu, true);
-        _gpu = MakeToggle("GPU 温度 / 功耗 / 占用", HwSensorsPlugin.KGpu, true);
-        _total = MakeToggle("整机预估功耗", HwSensorsPlugin.KTotal, true);
-        _battery = MakeToggle("电池电量 / 充放电功率", HwSensorsPlugin.KBattery, true);
-        _batteryHealth = MakeToggle("显示电池损耗程度（台式机可关掉）", HwSensorsPlugin.KBatteryHealth, true);
+        // ---- 胶囊形态显示配置 ----
+        panel.Children.Add(SectionTitle("胶囊形态显示内容"));
 
-        var monitorStack = new StackPanel { Spacing = 4 };
-        monitorStack.Children.Add(_cpu);
-        monitorStack.Children.Add(_gpu);
-        monitorStack.Children.Add(_total);
-        monitorStack.Children.Add(_battery);
-        monitorStack.Children.Add(_batteryHealth);
+        var savedRaw = _settings.Get(HwSensorsPlugin.KCapsuleItems, HwSensorsPlugin.DefaultCapsuleItemsRaw)
+                       ?? HwSensorsPlugin.DefaultCapsuleItemsRaw;
+        _selectedCapsuleKeys.Clear();
+        _selectedCapsuleKeys.AddRange(HwSensorsPlugin.ParseCapsuleItems(savedRaw));
+        if (_selectedCapsuleKeys.Count == 0)
+            _selectedCapsuleKeys.AddRange(SensorOptions.DefaultCapsuleItems);
 
-        panel.Children.Add(new TextBlock
+        _capsuleCategoryPicker = new ComboBox
         {
-            Text = "监控项",
-            FontSize = 13,
-            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            Margin = new Thickness(2, 8, 0, 0),
-        });
-        panel.Children.Add(Card(monitorStack));
+            Header = "选择硬件类型",
+            MinWidth = 280,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+        foreach (var (_, title) in Categories)
+            _capsuleCategoryPicker.Items.Add(title);
 
-        // ---- GPU 选择 ----
+        _capsuleCategoryPicker.SelectedIndex = DetectInitialCategoryIndex();
+        _capsuleCategoryPicker.SelectionChanged += (_, _) =>
+        {
+            if (_loading) return;
+            RebuildCapsuleCheckboxes();
+        };
+
+        _capsuleCheckboxPanel = new StackPanel { Spacing = 2, Margin = new Thickness(0, 4, 0, 2) };
+        _capsuleSummary = new TextBlock
+        {
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.85,
+        };
+
+        var resetCapsuleBtn = new Button { Content = "恢复默认（网速）" };
+        resetCapsuleBtn.Click += (_, _) =>
+        {
+            _selectedCapsuleKeys.Clear();
+            _selectedCapsuleKeys.AddRange(SensorOptions.DefaultCapsuleItems);
+            SaveCapsuleSelection();
+            _loading = true;
+            _capsuleCategoryPicker.SelectedIndex = 0;
+            _loading = false;
+            RebuildCapsuleCheckboxes();
+            UpdateCapsuleSummary();
+        };
+
+        var clearCapsuleBtn = new Button { Content = "清空已选" };
+        clearCapsuleBtn.Click += (_, _) =>
+        {
+            _selectedCapsuleKeys.Clear();
+            RebuildCapsuleCheckboxes();
+            UpdateCapsuleSummary();
+        };
+
+        var capsuleActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(0, 4, 0, 0) };
+        capsuleActions.Children.Add(resetCapsuleBtn);
+        capsuleActions.Children.Add(clearCapsuleBtn);
+
+        _capsuleFixedGrid = MakeToggle("为每个显示实例预分配网格容器", HwSensorsPlugin.KCapsuleFixedGrid, true);
+        _capsuleTwoRows = MakeToggle("允许双行显示", HwSensorsPlugin.KCapsuleTwoRows, false);
+        _capsuleHideLabels = MakeToggle("隐藏硬件类型描述文本（如 CPU / GPU / 内存）", HwSensorsPlugin.KCapsuleHideLabels, false);
+
+        _capsuleFontSize = new NumberBox
+        {
+            Header = "胶囊字号（统一作用于胶囊内全部内容）",
+            Value = Math.Clamp(_settings.Get(HwSensorsPlugin.KCapsuleFontSize, 13.0), 8.0, 18.0),
+            Minimum = 8,
+            Maximum = 18,
+            SmallChange = 0.5,
+            LargeChange = 1,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+            MinWidth = 220,
+        };
+        _capsuleFontSize.ValueChanged += (_, _) => CommitCapsuleFontSize();
+        _capsuleFontSize.LostFocus += (_, _) => CommitCapsuleFontSize();
+
+        _capsulePadLeft = new NumberBox
+        {
+            Header = "胶囊左边距（px）",
+            Value = Math.Clamp(_settings.Get(HwSensorsPlugin.KCapsulePadLeft, 10.0), 0.0, 30.0),
+            Minimum = 0,
+            Maximum = 30,
+            SmallChange = 1,
+            LargeChange = 2,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+            MinWidth = 140,
+        };
+        _capsulePadLeft.ValueChanged += (_, _) => CommitCapsulePadLeft();
+        _capsulePadLeft.LostFocus += (_, _) => CommitCapsulePadLeft();
+
+        _capsulePadRight = new NumberBox
+        {
+            Header = "胶囊右边距（px）",
+            Value = Math.Clamp(_settings.Get(HwSensorsPlugin.KCapsulePadRight, 10.0), 0.0, 30.0),
+            Minimum = 0,
+            Maximum = 30,
+            SmallChange = 1,
+            LargeChange = 2,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+            MinWidth = 140,
+        };
+        _capsulePadRight.ValueChanged += (_, _) => CommitCapsulePadRight();
+        _capsulePadRight.LostFocus += (_, _) => CommitCapsulePadRight();
+
+        var padRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+        padRow.Children.Add(_capsulePadLeft);
+        padRow.Children.Add(_capsulePadRight);
+
+        var capsuleStack = new StackPanel { Spacing = 8 };
+        capsuleStack.Children.Add(_capsuleCategoryPicker);
+        capsuleStack.Children.Add(_capsuleCheckboxPanel);
+        capsuleStack.Children.Add(_capsuleSummary);
+        capsuleStack.Children.Add(capsuleActions);
+        capsuleStack.Children.Add(_capsuleFixedGrid);
+        capsuleStack.Children.Add(new TextBlock
+        {
+            Text = "开启后每个显示项占用固定宽度的隐形网格容器（单行 2 格、双行 4 格，内部左描述右数值；超出网格数才滚动），彻底消除前面数值位数变化引起的左右抽动。",
+            FontSize = 11.5,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.65,
+        });
+        capsuleStack.Children.Add(_capsuleHideLabels);
+        capsuleStack.Children.Add(_capsuleTwoRows);
+        capsuleStack.Children.Add(new TextBlock
+        {
+            Text = "提醒：开启「允许双行显示」后胶囊可同屏显示最多 4 项，建议适当缩小下方胶囊字号（如 10 ~ 11）以获得更舒适的排版。",
+            FontSize = 11.5,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.72,
+        });
+        capsuleStack.Children.Add(_capsuleFontSize);
+        capsuleStack.Children.Add(padRow);
+
+        panel.Children.Add(Card(capsuleStack));
+
+        // ---- 硬件选择（GPU & 网卡） ----
+        panel.Children.Add(SectionTitle("硬件选择"));
+
         _gpuPicker = new ComboBox
         {
-            Header = "监控哪块显卡",
+            Header = "主显卡（用于胶囊与悬停卡片）",
             MinWidth = 300,
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
         _gpuPicker.SelectionChanged += (_, _) =>
         {
             if (_loading) return;
-            if (_gpuPicker.SelectedItem is not GpuChoice choice) return;
+            var idx = _gpuPicker.SelectedIndex;
+            if (idx < 0 || idx >= _gpuIds.Count) return;
 
+            var chosen = _gpuIds[idx];
             var current = _settings.Get(HwSensorsPlugin.KGpuId, string.Empty) ?? string.Empty;
-            if (string.Equals(current, choice.Id, StringComparison.OrdinalIgnoreCase)) return;
+            if (string.Equals(current, chosen, StringComparison.OrdinalIgnoreCase)) return;
 
-            _settings.Set(HwSensorsPlugin.KGpuId, choice.Id);
+            _settings.Set(HwSensorsPlugin.KGpuId, chosen);
         };
-
         FillGpuPicker();
 
-        panel.Children.Add(new TextBlock
+        _nicPicker = new ComboBox
         {
-            Text = "显卡",
-            FontSize = 13,
-            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            Margin = new Thickness(2, 8, 0, 0),
+            Header = "监控网卡",
+            MinWidth = 300,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+        _nicPicker.SelectionChanged += (_, _) =>
+        {
+            if (_loading) return;
+            var idx = _nicPicker.SelectedIndex;
+            if (idx < 0 || idx >= _nicIds.Count) return;
+
+            var chosen = _nicIds[idx];
+            var current = _settings.Get(HwSensorsPlugin.KNicId, string.Empty) ?? string.Empty;
+            if (string.Equals(current, chosen, StringComparison.OrdinalIgnoreCase)) return;
+
+            _settings.Set(HwSensorsPlugin.KNicId, chosen);
+        };
+        FillNicPicker();
+
+        var hwStack = new StackPanel { Spacing = 10 };
+        hwStack.Children.Add(_gpuPicker);
+        hwStack.Children.Add(new TextBlock
+        {
+            Text = "点击灵动岛展开的聚光大卡片会自动显示全部检测到的显卡，不受此项限制。",
+            FontSize = 11.5,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.65,
         });
-        panel.Children.Add(Card(_gpuPicker));
+        hwStack.Children.Add(_nicPicker);
+        panel.Children.Add(Card(hwStack));
 
         // ---- 参数 ----
+        panel.Children.Add(SectionTitle("参数"));
+
         _baseline = new NumberBox
         {
             Header = "整机功耗的固定基线（W）",
@@ -129,10 +309,10 @@ internal sealed class HwSensorsSettingsPage
         _interval = new NumberBox
         {
             Header = "采样间隔（毫秒）",
-            Value = Math.Clamp(_settings.Get(HwSensorsPlugin.KInterval, 2000), 500, 30000),
+            Value = Math.Clamp(_settings.Get(HwSensorsPlugin.KInterval, 1000), 500, 30000),
             Minimum = 500,
             Maximum = 30000,
-            SmallChange = 500,
+            SmallChange = 250,
             LargeChange = 1000,
             SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
             MinWidth = 220,
@@ -144,19 +324,10 @@ internal sealed class HwSensorsSettingsPage
         paramStack.Children.Add(_interval);
         paramStack.Children.Add(new TextBlock
         {
-            Text = "整机功耗：电池供电时直接用电池放电功率实测；交流供电时按 CPU + GPU + 这个基线估算"
-                   + "（屏幕、内存、硬盘、风扇等）。基线可以按自己机型微调。",
-            FontSize = 12,
+            Text = "整机功耗：电池供电时直接用电池放电功率实测；交流供电时按 CPU + GPU + 这个基线估算。",
+            FontSize = 11.5,
             TextWrapping = TextWrapping.Wrap,
-            Opacity = 0.7,
-        });
-
-        panel.Children.Add(new TextBlock
-        {
-            Text = "参数",
-            FontSize = 13,
-            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            Margin = new Thickness(2, 8, 0, 0),
+            Opacity = 0.65,
         });
         panel.Children.Add(Card(paramStack));
 
@@ -190,42 +361,157 @@ internal sealed class HwSensorsSettingsPage
         panel.Children.Add(actions);
         panel.Children.Add(_status);
 
+        RebuildCapsuleCheckboxes();
+        UpdateCapsuleSummary();
+
         _loading = false;
         return panel;
+    }
+
+    private int DetectInitialCategoryIndex()
+    {
+        if (_selectedCapsuleKeys.Count == 0) return 0;
+
+        var cats = _selectedCapsuleKeys
+            .Select(k => AllCapsuleItems.FirstOrDefault(x => x.Key == k)?.Category)
+            .Where(c => c is not null)
+            .Distinct()
+            .ToList();
+
+        if (cats.Count == 1)
+        {
+            var idx = Array.FindIndex(Categories, c => c.Id == cats[0]);
+            if (idx >= 0) return idx;
+        }
+
+        return Categories.Length - 1; // 跨类别时选“全部硬件”
+    }
+
+    private void RebuildCapsuleCheckboxes()
+    {
+        _capsuleCheckboxPanel.Children.Clear();
+        var catIdx = Math.Clamp(_capsuleCategoryPicker.SelectedIndex, 0, Categories.Length - 1);
+        var catId = Categories[catIdx].Id;
+
+        var defs = catId == "all"
+            ? AllCapsuleItems
+            : AllCapsuleItems.Where(x => x.Category == catId).ToArray();
+
+        foreach (var def in defs)
+        {
+            var cb = new CheckBox
+            {
+                Content = def.Label,
+                IsChecked = _selectedCapsuleKeys.Contains(def.Key),
+            };
+
+            cb.Checked += (_, _) =>
+            {
+                if (_loading) return;
+                if (!_selectedCapsuleKeys.Contains(def.Key))
+                {
+                    _selectedCapsuleKeys.Add(def.Key);
+                    SaveCapsuleSelection();
+                    UpdateCapsuleSummary();
+                }
+            };
+
+            cb.Unchecked += (_, _) =>
+            {
+                if (_loading) return;
+                if (_selectedCapsuleKeys.Remove(def.Key))
+                {
+                    if (_selectedCapsuleKeys.Count > 0)
+                        SaveCapsuleSelection();
+                    UpdateCapsuleSummary();
+                }
+            };
+
+            _capsuleCheckboxPanel.Children.Add(cb);
+        }
+    }
+
+    private void SaveCapsuleSelection()
+    {
+        var ordered = AllCapsuleItems
+            .Where(d => _selectedCapsuleKeys.Contains(d.Key))
+            .Select(d => d.Key)
+            .ToList();
+
+        var raw = ordered.Count > 0 ? string.Join(",", ordered) : HwSensorsPlugin.DefaultCapsuleItemsRaw;
+        var current = _settings.Get(HwSensorsPlugin.KCapsuleItems, HwSensorsPlugin.DefaultCapsuleItemsRaw);
+        if (string.Equals(current, raw, StringComparison.Ordinal)) return;
+
+        _settings.Set(HwSensorsPlugin.KCapsuleItems, raw);
+    }
+
+    private void UpdateCapsuleSummary()
+    {
+        if (_selectedCapsuleKeys.Count == 0)
+        {
+            _capsuleSummary.Text = "当前已选：（空，请至少勾选 1 项，否则将保持默认网速）";
+            return;
+        }
+
+        var labels = AllCapsuleItems
+            .Where(d => _selectedCapsuleKeys.Contains(d.Key))
+            .Select(d => d.ShortLabel);
+        _capsuleSummary.Text = "当前胶囊已选：" + string.Join(" · ", labels);
     }
 
     private void FillGpuPicker()
     {
         _gpuPicker.Items.Clear();
+        _gpuIds.Clear();
 
         var gpus = _plugin.Service?.Gpus ?? Array.Empty<GpuChoice>();
         var selected = _settings.Get(HwSensorsPlugin.KGpuId, string.Empty) ?? string.Empty;
 
-        if (gpus.Count == 0)
-        {
-            _gpuPicker.Items.Add("（还没发现显卡，稍后重新打开本页）");
-            _gpuPicker.SelectedIndex = 0;
-            return;
-        }
+        _gpuPicker.Items.Add("自动（优先独立显卡）");
+        _gpuIds.Add(string.Empty);
 
-        var index = 0;
         var selectedIndex = 0;
 
         foreach (var gpu in gpus)
         {
             _gpuPicker.Items.Add($"{gpu.Name}（{TypeLabel(gpu.Type)}）");
-            if (string.Equals(gpu.Id, selected, StringComparison.OrdinalIgnoreCase)) selectedIndex = index;
-            index++;
+            _gpuIds.Add(gpu.Id);
+            if (string.Equals(gpu.Id, selected, StringComparison.OrdinalIgnoreCase))
+                selectedIndex = _gpuIds.Count - 1;
         }
 
         _gpuPicker.SelectedIndex = selectedIndex;
     }
 
-    private static string TypeLabel(LibreHardwareMonitor.Hardware.HardwareType type) => type switch
+    private void FillNicPicker()
     {
-        LibreHardwareMonitor.Hardware.HardwareType.GpuNvidia => "NVIDIA 独显",
-        LibreHardwareMonitor.Hardware.HardwareType.GpuAmd => "AMD 显卡",
-        LibreHardwareMonitor.Hardware.HardwareType.GpuIntel => "Intel 核显",
+        _nicPicker.Items.Clear();
+        _nicIds.Clear();
+
+        var nics = _plugin.Service?.Nics ?? Array.Empty<NicChoice>();
+        var selected = _settings.Get(HwSensorsPlugin.KNicId, string.Empty) ?? string.Empty;
+
+        _nicPicker.Items.Add("自动（汇总活动物理网卡）");
+        _nicIds.Add(string.Empty);
+
+        var selectedIndex = 0;
+
+        foreach (var nic in nics)
+        {
+            _nicPicker.Items.Add($"{nic.Name}（{nic.Description}）");
+            _nicIds.Add(nic.Id);
+            if (string.Equals(nic.Id, selected, StringComparison.OrdinalIgnoreCase))
+                selectedIndex = _nicIds.Count - 1;
+        }
+
+        _nicPicker.SelectedIndex = selectedIndex;
+    }
+
+    private static string TypeLabel(HardwareType type) => type switch
+    {
+        HardwareType.GpuNvidia => "NVIDIA 独显",
+        HardwareType.GpuAmd => "AMD 显卡",
+        HardwareType.GpuIntel => "Intel 核显",
         _ => "显卡",
     };
 
@@ -240,68 +526,98 @@ internal sealed class HwSensorsSettingsPage
         toggle.Toggled += (_, _) =>
         {
             if (_loading) return;
-
             var value = toggle.IsOn;
-            if (_settings.Get(key, fallback) == value) return;   // 值没变就别写
-
+            if (_settings.Get(key, fallback) == value) return;
             _settings.Set(key, value);
         };
 
         return toggle;
     }
 
-    /// <summary>动作按钮里先调这个：把还没提交的输入框值写进设置。</summary>
     private void CommitEditors()
     {
         if (_loading) return;
-
+        CommitCapsuleFontSize();
+        CommitCapsulePadLeft();
+        CommitCapsulePadRight();
         CommitBaseline();
         CommitInterval();
+    }
+
+    private void CommitCapsuleFontSize()
+    {
+        if (_loading) return;
+        var value = Math.Clamp(double.IsNaN(_capsuleFontSize.Value) ? 13.0 : _capsuleFontSize.Value, 8.0, 18.0);
+        if (Math.Abs(_settings.Get(HwSensorsPlugin.KCapsuleFontSize, 13.0) - value) < 0.01) return;
+        _settings.Set(HwSensorsPlugin.KCapsuleFontSize, value);
+    }
+
+    private void CommitCapsulePadLeft()
+    {
+        if (_loading) return;
+        var value = Math.Clamp(double.IsNaN(_capsulePadLeft.Value) ? 10.0 : _capsulePadLeft.Value, 0.0, 30.0);
+        if (Math.Abs(_settings.Get(HwSensorsPlugin.KCapsulePadLeft, 10.0) - value) < 0.01) return;
+        _settings.Set(HwSensorsPlugin.KCapsulePadLeft, value);
+    }
+
+    private void CommitCapsulePadRight()
+    {
+        if (_loading) return;
+        var value = Math.Clamp(double.IsNaN(_capsulePadRight.Value) ? 10.0 : _capsulePadRight.Value, 0.0, 30.0);
+        if (Math.Abs(_settings.Get(HwSensorsPlugin.KCapsulePadRight, 10.0) - value) < 0.01) return;
+        _settings.Set(HwSensorsPlugin.KCapsulePadRight, value);
     }
 
     private void CommitBaseline()
     {
         if (_loading) return;
-
         var value = Math.Clamp(double.IsNaN(_baseline.Value) ? 8.0 : _baseline.Value, 0, 200);
         if (Math.Abs(_settings.Get(HwSensorsPlugin.KBaseline, 8.0) - value) < 0.01) return;
-
         _settings.Set(HwSensorsPlugin.KBaseline, value);
     }
 
     private void CommitInterval()
     {
         if (_loading) return;
-
-        var value = (int)Math.Clamp(double.IsNaN(_interval.Value) ? 2000 : _interval.Value, 500, 30000);
-        if (_settings.Get(HwSensorsPlugin.KInterval, 2000) == value) return;
-
+        var value = (int)Math.Clamp(double.IsNaN(_interval.Value) ? 1000 : _interval.Value, 500, 30000);
+        if (_settings.Get(HwSensorsPlugin.KInterval, 1000) == value) return;
         _settings.Set(HwSensorsPlugin.KInterval, value);
     }
 
-    /// <summary>把当前采样到的数据源情况说清楚 —— 用户最常问「为什么 CPU 读不到」。</summary>
     private string DescribeSources()
     {
-        var snapshot = _plugin.Service?.Latest;
-        if (snapshot is null) return "还没采到数据，稍等一下再点。";
+        var s = _plugin.Service?.Latest;
+        if (s is null) return "还没采到数据，稍等一下再点。";
 
         var lines = new List<string>
         {
-            $"CPU：{snapshot.CpuName ?? "未识别"}",
-            $"　温度 {HwSensorsView.Fmt(snapshot.CpuTempC, "0.0")} °C"
-                + (snapshot.CpuTempIsApprox ? "（ACPI 热区，非精确 Tctl）" : ""),
-            $"　功耗 {HwSensorsView.Fmt(snapshot.CpuPowerW, "0.0")} W（RAPL 能耗计数器）",
-            $"GPU：{snapshot.GpuName ?? "未发现"}",
-            $"　温度 {HwSensorsView.Fmt(snapshot.GpuTempC, "0.0")} °C / 功耗 {HwSensorsView.Fmt(snapshot.GpuPowerW, "0.0")} W",
-            snapshot.HasBattery
-                ? $"电池：{HwSensorsView.Fmt(snapshot.BatteryPercent, "0")}%，损耗 {HwSensorsView.Fmt(snapshot.BatteryDegradationPct, "0.#")}%"
-                : "电池：未发现（台式机正常）",
+            $"CPU：{s.CpuName ?? "未识别"} | 占用 {HwSensorsView.Fmt(s.CpuLoadPct, "0")}% / 功耗 {HwSensorsView.Fmt(s.CpuPowerW, "0.0")}W / 温度 {HwSensorsView.Fmt(s.CpuTempC, "0.0")}°C",
+            $"内存：占用 {HwSensorsView.Fmt(s.MemLoadPct, "0")}%（{HwSensorsView.Fmt(s.MemUsedGb, "0.0")} / {HwSensorsView.Fmt(s.MemTotalGb, "0.0")} GB）",
+            $"网卡：{s.NetAdapterName ?? "无"} | ↑ {SpeedFormatter.Format(s.NetUpBytesPerSec)} / ↓ {SpeedFormatter.Format(s.NetDownBytesPerSec)}",
         };
 
-        if (snapshot.Error is { } err) lines.Add($"错误：{err}");
+        foreach (var g in s.Gpus)
+        {
+            var tag = g.IsSelected ? "[主卡] " : "";
+            lines.Add($"GPU {tag}{g.Name}：D3D占用 {HwSensorsView.Fmt(g.LoadPct, "0")}%（核心 {HwSensorsView.Fmt(g.CoreLoadPct, "0")}%）| 功耗 {HwSensorsView.Fmt(g.PowerW, "0.0")}W | 温度 {HwSensorsView.Fmt(g.TempC, "0")}°C | 显存 {HwSensorsView.Fmt(g.VramLoadPct, "0")}%");
+        }
+
+        lines.Add(s.HasBattery
+            ? $"电池：{HwSensorsView.Fmt(s.BatteryPercent, "0")}%，总功耗 {HwSensorsView.Fmt(s.TotalPowerW, "0.0")}W"
+            : $"电源：交流供电，总功耗 {HwSensorsView.Fmt(s.TotalPowerW, "0.0")}W");
+
+        if (s.Error is { } err) lines.Add($"错误：{err}");
 
         return string.Join("\n", lines);
     }
+
+    private static TextBlock SectionTitle(string text) => new()
+    {
+        Text = text,
+        FontSize = 13,
+        FontWeight = FontWeights.SemiBold,
+        Margin = new Thickness(2, 8, 0, 0),
+    };
 
     private static Border Card(UIElement child) => new()
     {
@@ -309,6 +625,3 @@ internal sealed class HwSensorsSettingsPage
         Child = child,
     };
 }
-
-
-

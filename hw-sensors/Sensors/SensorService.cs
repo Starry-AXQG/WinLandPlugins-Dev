@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using LibreHardwareMonitor.Hardware;
 using WinIsland.Core;
@@ -6,15 +7,16 @@ using WinIsland.Core;
 namespace HwSensors.Sensors;
 
 /// <summary>
-/// 后台采样器：一条独立线程，按固定间隔采一次，把结果做成 <see cref="SensorSnapshot"/> 丢给 UI。
+/// 后台采样器：独立线程按固定间隔采一次，把结果做成 <see cref="SensorSnapshot"/> 推给 UI。
 ///
-/// 数据来源分工（都是免管理员能拿到的）：
-///   • CPU 名字 / 占用率 —— LibreHardwareMonitor（WMI 性能计数器，普通权限可读）
-///   • CPU 温度        —— PDH「Thermal Zone Information」ACPI 热区（LHM 的 Tctl 要 PawnIO 驱动）
-///   • CPU 功耗        —— PDH「Energy Meter」RAPL（LHM 的 SMU 通道同样要驱动）
-///   • GPU 温度/功耗/占用 —— LibreHardwareMonitor（NVAPI / ADL，普通权限可读）
-///   • 电池容量/损耗/充放功率 —— LibreHardwareMonitor 的 Battery 组
-///   • 交流/充电状态   —— kernel32 GetSystemPowerStatus（不依赖 WMI，最稳）
+/// 数据来源分工（全部免管理员）：
+///   • CPU 名字 / 占用率        —— LibreHardwareMonitor（WMI 性能计数器）
+///   • CPU 温度 / 功耗          —— PDH「Thermal Zone Information」与「Energy Meter」RAPL
+///   • 内存 占用率 / 已用总量   —— LibreHardwareMonitor（Total Memory /ram）
+///   • 多 GPU 温度/功耗/占用/显存 —— LibreHardwareMonitor（NVAPI / ADL / WDDM D3D 引擎计数）
+///     ※ GPU 占用率优先取所有 D3D 引擎负载的最大值（与 Windows 任务管理器算法一致），无 D3D 时回退 GPU Core
+///   • 网卡上传 / 下载速率      —— .NET NetworkInterface 字节增量（过滤虚拟与重复过滤驱动）
+///   • 电池与交流状态           —— LibreHardwareMonitor Battery + kernel32 GetSystemPowerStatus
 /// </summary>
 public sealed class SensorService : IDisposable
 {
@@ -27,27 +29,31 @@ public sealed class SensorService : IDisposable
     private volatile SensorOptions _options = new();
     private volatile SensorSnapshot _latest = new();
     private IReadOnlyList<GpuChoice> _gpus = Array.Empty<GpuChoice>();
+    private IReadOnlyList<NicChoice> _nics = Array.Empty<NicChoice>();
 
     private Computer? _computer;
     private PdhSet? _pdh;
     private bool _openFailed;
 
-    /// <summary>充放电趋势判定用的历史（判断「到底在充还是在放」不依赖驱动给的正负号）。</summary>
+    /// <summary>充放电趋势判定用的历史。</summary>
     private readonly Queue<double> _chargeHistory = new();
+
+    /// <summary>网卡速率计算用的上一轮字节计数。</summary>
+    private long _lastNetTimestamp;
+    private long _lastNetSent;
+    private long _lastNetRecv;
+    private string _lastNetSelection = string.Empty;
 
     public SensorService(IPluginLogger log) => _log = log;
 
-    /// <summary>采样结果（后台线程触发）。</summary>
     public event Action<SensorSnapshot>? SnapshotReady;
-
-    /// <summary>发现到的 GPU 列表（首次采样后才有内容）。</summary>
     public event Action<IReadOnlyList<GpuChoice>>? GpusDiscovered;
 
     public SensorSnapshot Latest => _latest;
-
     public IReadOnlyList<GpuChoice> Gpus => _gpus;
+    public IReadOnlyList<NicChoice> Nics => _nics;
 
-    public int IntervalMs { get; set; } = 2000;
+    public int IntervalMs { get; set; } = 1000;
 
     public void SetOptions(SensorOptions options) => _options = options;
 
@@ -64,7 +70,6 @@ public sealed class SensorService : IDisposable
         _thread.Start();
     }
 
-    /// <summary>让采样线程立刻采一次（改设置、点刷新时用）。</summary>
     public void RequestRefresh() => _wake.Set();
 
     private void Loop()
@@ -104,11 +109,11 @@ public sealed class SensorService : IDisposable
             {
                 IsCpuEnabled = true,
                 IsGpuEnabled = true,
+                IsMemoryEnabled = true,
                 IsBatteryEnabled = true,
                 IsMotherboardEnabled = false,
-                IsMemoryEnabled = false,
                 IsStorageEnabled = false,
-                IsNetworkEnabled = false,
+                IsNetworkEnabled = false, // 网卡使用 .NET NetworkInterface，避免 LHM 重复计算 WFP/QoS 过滤驱动
                 IsControllerEnabled = false,
                 IsPsuEnabled = false,
             };
@@ -116,10 +121,10 @@ public sealed class SensorService : IDisposable
             computer.Open();
             _computer = computer;
 
-            // 打开后立刻枚举一次 GPU，设置页的下拉菜单要用
             RefreshGpuList();
+            RefreshNicList();
 
-            _log.Info($"传感器已就绪（PDH {( _pdh.IsOpen ? "可用" : "不可用")}，GPU {_gpus.Count} 个）");
+            _log.Info($"传感器已就绪（PDH {(_pdh.IsOpen ? "可用" : "不可用")}，GPU {_gpus.Count} 个，网卡 {_nics.Count} 个）");
         }
         catch (Exception ex)
         {
@@ -148,13 +153,31 @@ public sealed class SensorService : IDisposable
             list.Add(new GpuChoice(hw.Identifier.ToString(), hw.Name, hw.HardwareType));
         }
 
-        // 独显排前面，设置页里默认就是它
         list.Sort((a, b) => Rank(a.Type).CompareTo(Rank(b.Type)));
 
         if (list.Count == 0 || list.Select(x => x.Id).SequenceEqual(_gpus.Select(x => x.Id))) return;
 
         _gpus = list;
         GpusDiscovered?.Invoke(list);
+    }
+
+    private void RefreshNicList()
+    {
+        try
+        {
+            var list = new List<NicChoice>();
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                list.Add(new NicChoice(nic.Id, nic.Name, nic.Description));
+            }
+            _nics = list;
+        }
+        catch
+        {
+            // 枚举网卡失败不影响其它传感器
+        }
     }
 
     private SensorSnapshot Sample()
@@ -168,15 +191,14 @@ public sealed class SensorService : IDisposable
             return snapshot;
         }
 
-        // PDH 的速率型计数器要「两次收集」才有值：本轮先收，再用上一轮到这一轮的差值
         _pdh?.Collect();
 
         var power = ReadSystemPower();
         snapshot.IsOnAc = power.OnAc;
         snapshot.IsCharging = power.Charging;
 
-        IHardware? gpu = null;
         IHardware? battery = null;
+        IHardware? physicalMem = null;
         var gpuCandidates = new List<IHardware>();
 
         if (_computer is not null)
@@ -186,7 +208,16 @@ public sealed class SensorService : IDisposable
                 switch (hw.HardwareType)
                 {
                     case HardwareType.Cpu:
-                        if (options.ShowCpu) ReadCpu(hw, snapshot);
+                        ReadCpu(hw, snapshot);
+                        break;
+
+                    case HardwareType.Memory:
+                        // 仅取物理内存（/ram 或 Total Memory），忽略虚拟内存（/vram）
+                        if (hw.Identifier.ToString().Equals("/ram", StringComparison.OrdinalIgnoreCase)
+                            || hw.Name.Equals("Total Memory", StringComparison.OrdinalIgnoreCase))
+                        {
+                            physicalMem = hw;
+                        }
                         break;
 
                     case HardwareType.Battery:
@@ -194,21 +225,52 @@ public sealed class SensorService : IDisposable
                         break;
 
                     default:
-                        // 遍历顺序不保证，先把所有显卡收起来，最后按「指定的 > 独显优先」挑一张
                         if (IsGpu(hw.HardwareType)) gpuCandidates.Add(hw);
                         break;
                 }
             }
 
-            gpu = PickGpu(gpuCandidates, options);
+            // 内存
+            if (physicalMem is not null)
+                ReadMemory(physicalMem, snapshot);
 
-            if (options.ShowGpu && gpu is not null) ReadGpu(gpu, snapshot);
+            // 所有 GPU 均采样（聚光卡展示多 GPU，卡片形态取选中主卡）
+            gpuCandidates.Sort((a, b) => Rank(a.HardwareType).CompareTo(Rank(b.HardwareType)));
+            var selectedHw = PickGpu(gpuCandidates, options);
+            var gpuList = new List<GpuSnapshot>(gpuCandidates.Count);
 
-            if (battery is not null) ReadBattery(battery, snapshot);
+            foreach (var hw in gpuCandidates)
+            {
+                var g = ReadGpu(hw);
+                g.IsSelected = ReferenceEquals(hw, selectedHw);
+                gpuList.Add(g);
+
+                if (g.IsSelected)
+                {
+                    snapshot.GpuName = g.Name;
+                    snapshot.GpuTempC = g.TempC;
+                    snapshot.GpuHotSpotC = g.HotSpotC;
+                    snapshot.GpuPowerW = g.PowerW;
+                    snapshot.GpuLoadPct = g.LoadPct;
+                    snapshot.GpuCoreLoadPct = g.CoreLoadPct;
+
+                    snapshot.VramLoadPct = g.VramLoadPct;
+                    snapshot.VramUsedMb = g.VramUsedMb;
+                    snapshot.VramTotalMb = g.VramTotalMb;
+                    snapshot.VramTempC = g.VramTempC;
+                    snapshot.VramPowerW = g.VramPowerW;
+                }
+            }
+
+            snapshot.Gpus = gpuList;
+
+            // 电池
+            if (battery is not null)
+                ReadBattery(battery, snapshot);
         }
 
-        // ---- CPU 温度/功耗：PDH ----
-        if (options.ShowCpu && _pdh is not null)
+        // ---- CPU 温度 / 功耗：PDH ----
+        if (_pdh is not null)
         {
             var pdhTemp = _pdh.ThermalZoneC();
             if (pdhTemp is not null)
@@ -221,25 +283,22 @@ public sealed class SensorService : IDisposable
             if (pdhPower is not null) snapshot.CpuPowerW = pdhPower;
         }
 
+        // ---- 网卡上传 / 下载速率 ----
+        ReadNetwork(snapshot, options);
+
         // ---- 整机功耗 ----
-        if (options.ShowTotal)
-        {
-            snapshot.TotalPowerW = EstimateTotal(snapshot, options);
-            snapshot.TotalIsMeasured = snapshot.IsOnAc ? false : snapshot.BatteryDischargeW is > 0.5;
-        }
+        snapshot.TotalPowerW = EstimateTotal(snapshot, options);
+        snapshot.TotalIsMeasured = !snapshot.IsOnAc && snapshot.BatteryDischargeW is > 0.5;
 
         snapshot.HasData = snapshot.CpuTempC is not null || snapshot.CpuPowerW is not null
-                           || snapshot.GpuTempC is not null || snapshot.GpuPowerW is not null
-                           || snapshot.BatteryPercent is not null;
+                           || snapshot.CpuLoadPct is not null || snapshot.MemLoadPct is not null
+                           || snapshot.GpuTempC is not null || snapshot.GpuLoadPct is not null
+                           || snapshot.NetDownBytesPerSec is not null || snapshot.BatteryPercent is not null;
 
         snapshot.Timestamp = DateTime.Now;
         return snapshot;
     }
 
-    /// <summary>
-    /// 整机功耗：优先用电池实测（放电时电池输出的功率就是整机的真实功耗），
-    /// 拿不到就按 CPU + GPU + 固定基线估算。
-    /// </summary>
     private static double? EstimateTotal(SensorSnapshot s, SensorOptions options)
     {
         if (s.BatteryDischargeW is > 1.0) return s.BatteryDischargeW;
@@ -248,7 +307,19 @@ public sealed class SensorService : IDisposable
         var any = false;
 
         if (s.CpuPowerW is > 0) { sum += s.CpuPowerW.Value; any = true; }
-        if (s.GpuPowerW is > 0) { sum += s.GpuPowerW.Value; any = true; }
+        // 汇总所有 GPU 的功耗（笔记本常见独显+核显同时耗电）
+        if (s.Gpus.Count > 0)
+        {
+            foreach (var g in s.Gpus)
+            {
+                if (g.PowerW is > 0) { sum += g.PowerW.Value; any = true; }
+            }
+        }
+        else if (s.GpuPowerW is > 0)
+        {
+            sum += s.GpuPowerW.Value;
+            any = true;
+        }
 
         if (!any) return null;
 
@@ -258,7 +329,6 @@ public sealed class SensorService : IDisposable
     private static void ReadCpu(IHardware cpu, SensorSnapshot s)
     {
         cpu.Update();
-
         s.CpuName = cpu.Name;
 
         foreach (var sensor in cpu.Sensors)
@@ -267,12 +337,10 @@ public sealed class SensorService : IDisposable
 
             switch (sensor.SensorType)
             {
-                // 「CPU Total」是整颗 CPU 的占用率；分核心的项不要
                 case SensorType.Load when sensor.Name.Equals("CPU Total", StringComparison.OrdinalIgnoreCase):
                     s.CpuLoadPct = value;
                     break;
 
-                // LHM 的 Tctl/Tdie 在非管理员下恒为 0（要内核驱动），只在真的读到值时兜底用
                 case SensorType.Temperature when value > 0 && s.CpuTempC is null &&
                                                  sensor.Name.Contains("Tctl", StringComparison.OrdinalIgnoreCase):
                     s.CpuTempC = value;
@@ -286,45 +354,267 @@ public sealed class SensorService : IDisposable
         }
     }
 
-    private static void ReadGpu(IHardware gpu, SensorSnapshot s)
+    private static void ReadMemory(IHardware mem, SensorSnapshot s)
     {
-        gpu.Update();
+        mem.Update();
 
-        s.GpuName = gpu.Name;
+        double? used = null, avail = null;
 
-        foreach (var sensor in gpu.Sensors)
+        foreach (var sensor in mem.Sensors)
         {
             if (sensor.Value is not { } value) continue;
 
             switch (sensor.SensorType)
             {
-                case SensorType.Temperature:
-                    if (sensor.Name.Equals("GPU Core", StringComparison.OrdinalIgnoreCase))
-                        s.GpuTempC = value;
-                    else if (sensor.Name.Contains("Hot Spot", StringComparison.OrdinalIgnoreCase))
-                        s.GpuHotSpotC = value;
+                case SensorType.Load when sensor.Name.Equals("Memory", StringComparison.OrdinalIgnoreCase):
+                    s.MemLoadPct = value;
                     break;
 
-                case SensorType.Power:
-                    // NVIDIA 叫「GPU Package」，AMD 核显叫「GPU Core」
-                    if (sensor.Name.Contains("Package", StringComparison.OrdinalIgnoreCase) ||
-                        sensor.Name.Equals("GPU Core", StringComparison.OrdinalIgnoreCase))
-                    {
-                        s.GpuPowerW = value;
-                    }
+                case SensorType.Data when sensor.Name.Equals("Memory Used", StringComparison.OrdinalIgnoreCase):
+                    used = value;
                     break;
 
-                case SensorType.Load when sensor.Name.Equals("GPU Core", StringComparison.OrdinalIgnoreCase):
-                    s.GpuLoadPct = value;
+                case SensorType.Data when sensor.Name.Equals("Memory Available", StringComparison.OrdinalIgnoreCase):
+                    avail = value;
+                    break;
+
+                case SensorType.Power when value > 0 && s.MemPowerW is null:
+                    s.MemPowerW = value;
+                    break;
+
+                case SensorType.Temperature when value > 0 && s.MemTempC is null:
+                    s.MemTempC = value;
                     break;
             }
         }
+
+        s.MemUsedGb = used;
+        if (used is not null && avail is not null)
+        {
+            s.MemTotalGb = used.Value + avail.Value;
+            if (s.MemLoadPct is null && s.MemTotalGb > 0)
+                s.MemLoadPct = used.Value / s.MemTotalGb.Value * 100.0;
+        }
+    }
+
+    /// <summary>
+    /// 读取单张显卡的全部指标：
+    /// 关键修复：Windows 任务管理器的 GPU 占用率取所有 WDDM D3D 引擎（3D、Video Decode、Encode、Copy、Compute 等）
+    /// 负载的最大值。LibreHardwareMonitor 通过 D3D * 传感器暴露这些引擎负载，优先取 max(D3D *) 即可与任务管理器对齐；
+    /// 仅当硬件无 D3D 传感器时才回退至 GPU Core。
+    /// </summary>
+    private static GpuSnapshot ReadGpu(IHardware gpu)
+    {
+        gpu.Update();
+
+        var g = new GpuSnapshot
+        {
+            Id = gpu.Identifier.ToString(),
+            Name = gpu.Name,
+            Type = gpu.HardwareType,
+        };
+
+        double? d3dMaxLoad = null;
+        double? fallbackTemp = null;
+        double? d3dDedUsed = null;
+        double? d3dDedTotal = null;
+
+        foreach (var sensor in gpu.Sensors)
+        {
+            if (sensor.Value is not { } value || float.IsNaN(value)) continue;
+
+            switch (sensor.SensorType)
+            {
+                case SensorType.Temperature:
+                    if (sensor.Name.Equals("GPU Core", StringComparison.OrdinalIgnoreCase))
+                        g.TempC = value;
+                    else if (sensor.Name.Contains("Hot Spot", StringComparison.OrdinalIgnoreCase))
+                        g.HotSpotC = value;
+                    else if (sensor.Name.Contains("Memory", StringComparison.OrdinalIgnoreCase))
+                        g.VramTempC = value;
+                    else if (fallbackTemp is null && value > 0)
+                        fallbackTemp = value; // 例如 AMD 核显的 GPU VR SoC
+                    break;
+
+                case SensorType.Power:
+                    if (sensor.Name.Contains("Memory", StringComparison.OrdinalIgnoreCase))
+                    {
+                        g.VramPowerW = value;
+                    }
+                    else if (sensor.Name.Contains("Package", StringComparison.OrdinalIgnoreCase) ||
+                             sensor.Name.Equals("GPU Core", StringComparison.OrdinalIgnoreCase))
+                    {
+                        g.PowerW = value;
+                    }
+                    break;
+
+                case SensorType.Load:
+                    if (sensor.Name.StartsWith("D3D ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var clamped = Math.Clamp((double)value, 0.0, 100.0);
+                        if (d3dMaxLoad is null || clamped > d3dMaxLoad.Value)
+                            d3dMaxLoad = clamped;
+                    }
+                    else if (sensor.Name.Equals("GPU Core", StringComparison.OrdinalIgnoreCase))
+                    {
+                        g.CoreLoadPct = Math.Clamp((double)value, 0.0, 100.0);
+                    }
+                    else if (sensor.Name.Equals("GPU Memory", StringComparison.OrdinalIgnoreCase))
+                    {
+                        g.VramLoadPct = Math.Clamp((double)value, 0.0, 100.0);
+                    }
+                    break;
+
+                case SensorType.SmallData:
+                    if (sensor.Name.Equals("GPU Memory Used", StringComparison.OrdinalIgnoreCase))
+                        g.VramUsedMb = value;
+                    else if (sensor.Name.Equals("GPU Memory Total", StringComparison.OrdinalIgnoreCase))
+                        g.VramTotalMb = value;
+                    else if (sensor.Name.Equals("D3D Dedicated Memory Used", StringComparison.OrdinalIgnoreCase))
+                        d3dDedUsed = value;
+                    else if (sensor.Name.Equals("D3D Dedicated Memory Total", StringComparison.OrdinalIgnoreCase))
+                        d3dDedTotal = value;
+                    break;
+            }
+        }
+
+        // 温度兜底（如 AMD 核显无 GPU Core 温度，只有 GPU VR SoC）
+        g.TempC ??= fallbackTemp;
+
+        // GPU 占用率：优先采用与任务管理器一致的 max(D3D *)，无 D3D 传感器时回退 GPU Core
+        g.LoadPct = d3dMaxLoad ?? g.CoreLoadPct;
+
+        // 显存容量兜底与占用率推算
+        g.VramUsedMb ??= d3dDedUsed;
+        g.VramTotalMb ??= d3dDedTotal;
+        if (g.VramLoadPct is null && g.VramUsedMb is >= 0 && g.VramTotalMb is > 0)
+        {
+            g.VramLoadPct = Math.Clamp(g.VramUsedMb.Value / g.VramTotalMb.Value * 100.0, 0.0, 100.0);
+        }
+
+        return g;
+    }
+
+    private void ReadNetwork(SensorSnapshot s, SensorOptions options)
+    {
+        try
+        {
+            var all = NetworkInterface.GetAllNetworkInterfaces();
+            var selected = new List<NetworkInterface>();
+
+            if (!string.IsNullOrEmpty(options.NicId))
+            {
+                foreach (var nic in all)
+                {
+                    if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                    if (string.Equals(nic.Id, options.NicId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        selected.Add(nic);
+                        break;
+                    }
+                }
+            }
+
+            if (selected.Count == 0)
+            {
+                // 自动模式：仅选取活动物理网卡，避免代理 TUN / VMware 虚拟网卡重复计费
+                foreach (var nic in all)
+                {
+                    if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                    if (!IsPhysicalAdapter(nic)) continue;
+                    selected.Add(nic);
+                }
+
+                // 若当前没有任何标准物理网卡（如纯虚拟化环境），退回全部非回环活动网卡
+                if (selected.Count == 0)
+                {
+                    foreach (var nic in all)
+                    {
+                        if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                        if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                        selected.Add(nic);
+                    }
+                }
+            }
+
+            long totalSent = 0;
+            long totalRecv = 0;
+            var names = new List<string>(selected.Count);
+
+            foreach (var nic in selected)
+            {
+                var stats = nic.GetIPStatistics();
+                totalSent += stats.BytesSent;
+                totalRecv += stats.BytesReceived;
+                names.Add(nic.Name);
+            }
+
+            var selectionKey = string.Join("|", selected.Select(n => n.Id));
+            var now = Stopwatch.GetTimestamp();
+
+            s.NetAdapterName = names.Count > 0 ? string.Join(" + ", names) : "无活动网卡";
+
+            if (_lastNetTimestamp != 0 && _lastNetSelection == selectionKey)
+            {
+                var dt = (now - _lastNetTimestamp) / (double)Stopwatch.Frequency;
+                if (dt > 0.05)
+                {
+                    var dSent = totalSent - _lastNetSent;
+                    var dRecv = totalRecv - _lastNetRecv;
+                    s.NetUpBytesPerSec = dSent >= 0 ? dSent / dt : 0.0;
+                    s.NetDownBytesPerSec = dRecv >= 0 ? dRecv / dt : 0.0;
+                }
+            }
+            else
+            {
+                s.NetUpBytesPerSec = 0.0;
+                s.NetDownBytesPerSec = 0.0;
+            }
+
+            _lastNetTimestamp = now;
+            _lastNetSent = totalSent;
+            _lastNetRecv = totalRecv;
+            _lastNetSelection = selectionKey;
+        }
+        catch
+        {
+            // 单次网卡读取异常忽略
+        }
+    }
+
+    private static bool IsPhysicalAdapter(NetworkInterface nic)
+    {
+        var type = nic.NetworkInterfaceType;
+        if (type is NetworkInterfaceType.Loopback
+            or NetworkInterfaceType.Tunnel
+            or NetworkInterfaceType.Unknown)
+        {
+            return false;
+        }
+
+        // IF_TYPE_PROP_VIRTUAL (53) 常用于 Clash/Wintun/VPN 虚拟隧道
+        if ((int)type == 53) return false;
+
+        var desc = nic.Description ?? string.Empty;
+        if (desc.Contains("Virtual", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("VMware", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("Hyper-V", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("Wintun", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("Tunnel", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("TAP-", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("Loopback", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("Pseudo", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("Bluetooth", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return true;
     }
 
     private void ReadBattery(IHardware battery, SensorSnapshot s)
     {
         battery.Update();
-
         s.HasBattery = true;
 
         double? designed = null, full = null, remaining = null, rate = null;
@@ -345,43 +635,22 @@ public sealed class SensorService : IDisposable
             }
         }
 
-        // 容量单位是 mWh
         if (designed is > 0) s.BatteryDesignWh = designed / 1000.0;
         if (full is > 0) s.BatteryFullWh = full / 1000.0;
 
-        // 库没给损耗率时自己算：(设计 - 满充) / 设计
         if (s.BatteryDegradationPct is null && designed is > 0 && full is > 0)
             s.BatteryDegradationPct = Math.Clamp((designed.Value - full.Value) / designed.Value * 100.0, 0, 100);
 
-        // 充电功率：库的正负号在不同机型上不一致，用「电量在涨还是在掉」判断方向
         var rising = IsChargeLevelRising(s.BatteryPercent);
 
         if (rate is > 0.1)
         {
-            if (rising == true)
-            {
-                // 电量在涨 = 一定在充电
-                s.BatteryChargeW = rate;
-            }
-            else if (rising == false)
-            {
-                // 电量在掉：插着电也说明没充进去（比如限充到 80% 后掉电），算放电
-                s.BatteryDischargeW = rate;
-            }
-            else if (s.IsCharging)
-            {
-                // 趋势还看不出来，但系统明确说在充电
-                s.BatteryChargeW = rate;
-            }
-            else if (!s.IsOnAc)
-            {
-                // 没插电就是放电
-                s.BatteryDischargeW = rate;
-            }
-            // 插着电、系统没说在充、电量也没涨：多半是已经充满在涓流，不显示功率
+            if (rising == true) s.BatteryChargeW = rate;
+            else if (rising == false) s.BatteryDischargeW = rate;
+            else if (s.IsCharging) s.BatteryChargeW = rate;
+            else if (!s.IsOnAc) s.BatteryDischargeW = rate;
         }
 
-        // 预计充满：(满充容量 - 剩余容量) / 充电功率
         if (s.BatteryChargeW is > 0.5 && full is > 0 && remaining is > 0 && full > remaining)
         {
             var hours = (full.Value - remaining.Value) / 1000.0 / s.BatteryChargeW.Value;
@@ -389,7 +658,6 @@ public sealed class SensorService : IDisposable
         }
     }
 
-    /// <summary>用最近几次采样的电量趋势判断在充还是在放（返回 null = 还看不出来）。</summary>
     private bool? IsChargeLevelRising(double? percent)
     {
         if (percent is null) return null;
@@ -401,10 +669,7 @@ public sealed class SensorService : IDisposable
 
             if (_chargeHistory.Count < 3) return null;
 
-            var first = _chargeHistory.First();
-            var last = _chargeHistory.Last();
-            var delta = last - first;
-
+            var delta = _chargeHistory.Last() - _chargeHistory.First();
             if (delta > 0.4) return true;
             if (delta < -0.4) return false;
             return null;
@@ -413,11 +678,10 @@ public sealed class SensorService : IDisposable
 
     private static bool MatchesGpu(IHardware hw, SensorOptions options)
     {
-        if (string.IsNullOrEmpty(options.GpuId)) return true;   // 空 = 自动，取列表第一个（独显优先）
+        if (string.IsNullOrEmpty(options.GpuId)) return true;
         return string.Equals(hw.Identifier.ToString(), options.GpuId, StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>挑要读的那张卡：设置里指定了就听设置的，否则独显优先。</summary>
     private static IHardware? PickGpu(List<IHardware> candidates, SensorOptions options)
     {
         if (candidates.Count == 0) return null;
@@ -430,7 +694,6 @@ public sealed class SensorService : IDisposable
             }
         }
 
-        // 自动：NVIDIA 独显 > AMD > Intel，同类型取列表第一个
         IHardware? best = null;
         var bestRank = int.MaxValue;
 
@@ -474,7 +737,7 @@ public sealed class SensorService : IDisposable
         if (!GetSystemPowerStatus(out var status)) return (false, false);
 
         var onAc = status.AcLineStatus == 1;
-        var charging = (status.BatteryFlag & 0x08) != 0;   // bit3 = 正在充电
+        var charging = (status.BatteryFlag & 0x08) != 0;
         return (onAc, charging && onAc);
     }
 
@@ -489,7 +752,3 @@ public sealed class SensorService : IDisposable
         _wake.Dispose();
     }
 }
-
-/// <summary>设置页下拉菜单里的一个 GPU 选项。</summary>
-public sealed record GpuChoice(string Id, string Name, HardwareType Type);
-

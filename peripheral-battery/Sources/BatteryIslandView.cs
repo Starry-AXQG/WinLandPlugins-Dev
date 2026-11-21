@@ -1,128 +1,262 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
-using Microsoft.UI.Xaml.Shapes;
 using WinIsland.Core;
 
 namespace PeripheralBattery;
 
 /// <summary>
-/// 岛上的视图：一棵树同时承载紧凑态（最告急的一台）和展开态（尽可能多的台）。
-/// 首行与展开行共用同一个 <see cref="DeviceRow"/>，字号、图标位宽、电量条宽度、
-/// 百分比右对齐全部一致，展开时不会出现"第一行和下面几行不是一套"的观感。
-/// 逐帧动画、共享画刷换主题、隐藏用 Height+Opacity —— 三条都是宿主插件的硬性要求。
+/// 灵动岛视图（单树同时承载胶囊态与展开卡片态）：
+/// - 胶囊态：并排展示多个极简无边框圆弧表盘（270° 圆弧 + 充电顶部闪电 + 中央图标 + 底部电量百分比）；
+/// - 展开卡片态：每个设备一个独立的方圆形容器（圆弧表盘 + 底部设备名），支持单行标准容器与双行紧凑容器；
+/// - 变形动画：8ms 高精度 Stopwatch 逐帧驱动，双层错峰 Opacity + TranslateY + 高度裁剪，零文字重排、零抽搐。
 /// </summary>
 public sealed class BatteryIslandView : UserControl, IMorphView
 {
-    private const double RowHeight = 28;
-    private const double RowSpacing = 4;
-    private const double BarHeight = 5;
-    private const double RowBarWidth = 46;
+    private const int MaxCapsuleSlots = 6;
+    private const int MaxCardSlots = 12;
 
-    /// <summary>紧凑态与展开态共用的字号，保证首行与下方各行完全一致。</summary>
-    private const double RowTitleSize = 14;
-    private const double RowMetaSize = 12;
-    private const double RowLevelSize = 13;
-    private const double RowIconSize = 14;
-    private const double RowIconSlot = 20;
-    private const double RowLevelSlot = 36;
+    // 胶囊态尺寸
+    private const double CapsuleHeight = 40;
+    private const double CapsuleGaugeDiameter = 34;
+    private const double CapsuleItemSpacing = 10;
 
-    /// <summary>
-    /// 设备名最大宽度。名字比这更长时由 TextTrimming 打点，保证右侧电量条和百分比的位置
-    /// 不被长名字挤走 —— 各行百分比必须右对齐在同一列。
-    /// </summary>
-    private const double RowNameMaxWidth = 210;
+    // 卡片态：单行标准容器尺寸
+    private const double SingleRowCardWidth = 88;
+    private const double SingleRowCardHeight = 110;
+    private const double SingleRowGaugeDiameter = 64;
+    private const double SingleRowSpacing = 10;
+    private const double SingleRowPaddingY = 12;
 
-    private const double RootPaddingTop = 5;
-    private const double RootPaddingBottom = 5;
-    private const double HeaderDetailSpacing = 8;
+    // 卡片态：双行紧凑容器尺寸
+    private const double TwoRowCardWidth = 78;
+    private const double TwoRowCardHeight = 76;
+    private const double TwoRowGaugeDiameter = 46;
+    private const double TwoRowSpacing = 8;
+    private const double TwoRowPaddingY = 10;
 
-    /// <summary>
-    /// 展开态高度上限。取「硬件监控」那张卡的 152（小岛插件里的标准展开高度），
-    /// 不要比同屏其它插件高出一截 —— 卡片一旦比邻居高太多，整个展开队列都会被它撑歪。
-    /// </summary>
-    private const double MaxExpandedHeight = 152;
-
-    /// <summary>展开态最多能塞下的行数：按高度上限算，头行之外的部分。</summary>
-    private const int MaxRows =
-        (int)((MaxExpandedHeight - RootPaddingTop - RootPaddingBottom - RowHeight - HeaderDetailSpacing + RowSpacing)
-              / (RowHeight + RowSpacing));
-
-    /// <summary>与宿主内置视图同一条 BackEase 曲线的幅度。</summary>
     private const double BackAmplitude = 0.45;
 
-    private static readonly Windows.UI.Color AccentColor = Windows.UI.Color.FromArgb(255, 76, 194, 255);
-    private static readonly Windows.UI.Color LowColor = Windows.UI.Color.FromArgb(255, 255, 107, 107);
-    private static readonly Windows.UI.Color ChargingColor = Windows.UI.Color.FromArgb(255, 126, 231, 135);
-
     private readonly IIslandTheme _theme;
-
-    private readonly DeviceRow _header;
-    private readonly StackPanel _detail;
-    private readonly List<DeviceRow> _rows = new();
-    private readonly RectangleGeometry _detailClip = new();
+    private readonly string _fallbackGlyph;
 
     private readonly SolidColorBrush _textBrush = new();
     private readonly SolidColorBrush _mutedBrush = new();
     private readonly SolidColorBrush _faintBrush = new();
     private readonly SolidColorBrush _trackBrush = new();
+    private readonly SolidColorBrush _cardBgBrush = new();
+    private readonly SolidColorBrush _cardBorderBrush = new();
+
+    private readonly Grid _ringRoot;
+    private readonly ClassicBatteryIslandView _classicView;
+    private BatteryUiStyle _activeStyle = BatteryUiStyle.Ring;
+
+    // 胶囊层
+    private readonly Grid _compactLayer;
+    private readonly TranslateTransform _compactTransform = new();
+    private readonly List<BatteryArcGauge> _capsuleGauges = new(MaxCapsuleSlots);
+
+    // 展开层（包含单行容器组、双行容器组、空状态提示，全部常驻可视树）
+    private readonly Grid _expandedLayer;
+    private readonly TranslateTransform _expandedTransform = new();
+    private readonly RectangleGeometry _expandedClip = new();
+    private readonly StackPanel _singleRowPanel;
+    private readonly StackPanel _twoRowOuterPanel;
+    private readonly StackPanel _twoRowTopPanel;
+    private readonly StackPanel _twoRowBottomPanel;
+    private readonly Border _emptyCard;
+
+    private readonly List<SquircleDeviceCard> _singleRowCards = new(MaxCardSlots);
+    private readonly List<SquircleDeviceCard> _twoRowCards = new(MaxCardSlots);
 
     private readonly DispatcherQueueTimer? _morphTimer;
-    private DateTimeOffset _morphStart;
+    private long _morphStartTicks;
     private TimeSpan _morphDuration = TimeSpan.FromMilliseconds(333);
     private double _morphFrom;
     private double _morphTarget;
-
-    /// <summary>0 = 紧凑，1 = 展开。反转动画时从这里接着走。</summary>
     private double _progress;
 
-    private double _expandedDetailHeight;
-    private int _visibleRowCount;
+    private double _desiredCompactWidth = 140;
+    private double _desiredExpandedWidth = 412;
+    private double _desiredExpandedHeight = 134;
 
     public BatteryIslandView(PluginManifest manifest, IIslandTheme theme)
     {
         _theme = theme;
-        ApplyThemeColors();
-        _theme.Changed += ApplyThemeColors;
+        _fallbackGlyph = manifest.IconGlyph ?? "\uE83F";
 
-        _header = new DeviceRow(_textBrush, _mutedBrush, _faintBrush, _trackBrush, manifest.IconGlyph ?? "\uE83F");
+        // 1. 胶囊态层：极简无边框圆弧并排
+        var capsuleRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = CapsuleItemSpacing,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
 
-        // 展开态才显示的若干行：一开始就常驻可视树，Height/Opacity 归零藏起来
-        _detail = new StackPanel
+        for (var i = 0; i < MaxCapsuleSlots; i++)
+        {
+            var gauge = new BatteryArcGauge(
+                diameter: CapsuleGaugeDiameter,
+                strokeThickness: 3.2,
+                iconFontSize: 12,
+                percentFontSize: 8.5,
+                textBrush: _textBrush,
+                trackBrush: _trackBrush);
+            _capsuleGauges.Add(gauge);
+            capsuleRow.Children.Add(gauge.Root);
+        }
+
+        _compactLayer = new Grid
+        {
+            Height = CapsuleHeight,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            RenderTransform = _compactTransform,
+        };
+        _compactLayer.Children.Add(capsuleRow);
+
+        // 2. 展开卡片层：单行标准方圆容器 + 双行紧凑方圆容器
+        _singleRowPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = SingleRowSpacing,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+
+        for (var i = 0; i < MaxCardSlots; i++)
+        {
+            var card = new SquircleDeviceCard(
+                cardWidth: SingleRowCardWidth,
+                cardHeight: SingleRowCardHeight,
+                cornerRadius: 16,
+                gaugeDiameter: SingleRowGaugeDiameter,
+                strokeThickness: 5.5,
+                iconFontSize: 21,
+                percentFontSize: 11.5,
+                nameFontSize: 11.5,
+                nameTopMargin: 5,
+                cardPadding: new Thickness(6, 7, 6, 7),
+                textBrush: _textBrush,
+                trackBrush: _trackBrush,
+                cardBgBrush: _cardBgBrush,
+                cardBorderBrush: _cardBorderBrush);
+            _singleRowCards.Add(card);
+            _singleRowPanel.Children.Add(card.Root);
+        }
+
+        _twoRowTopPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = TwoRowSpacing,
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        _twoRowBottomPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = TwoRowSpacing,
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        _twoRowOuterPanel = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            Spacing = TwoRowSpacing,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            Visibility = Visibility.Collapsed,
+        };
+        _twoRowOuterPanel.Children.Add(_twoRowTopPanel);
+        _twoRowOuterPanel.Children.Add(_twoRowBottomPanel);
+
+        for (var i = 0; i < MaxCardSlots; i++)
+        {
+            var card = new SquircleDeviceCard(
+                cardWidth: TwoRowCardWidth,
+                cardHeight: TwoRowCardHeight,
+                cornerRadius: 13,
+                gaugeDiameter: TwoRowGaugeDiameter,
+                strokeThickness: 4.2,
+                iconFontSize: 15,
+                percentFontSize: 9.5,
+                nameFontSize: 10.5,
+                nameTopMargin: 2,
+                cardPadding: new Thickness(5, 4, 5, 4),
+                textBrush: _textBrush,
+                trackBrush: _trackBrush,
+                cardBgBrush: _cardBgBrush,
+                cardBorderBrush: _cardBorderBrush);
+            _twoRowCards.Add(card);
+        }
+
+        _emptyCard = new Border
+        {
+            Background = _cardBgBrush,
+            BorderBrush = _cardBorderBrush,
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(14),
+            Padding = new Thickness(24, 16, 24, 16),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            Visibility = Visibility.Collapsed,
+            Child = new TextBlock
+            {
+                Text = "未发现外设",
+                FontSize = 13,
+                Foreground = _mutedBrush,
+                HorizontalAlignment = HorizontalAlignment.Center,
+            },
+        };
+
+        _expandedLayer = new Grid
         {
             Height = 0,
             Opacity = 0,
-            Spacing = RowSpacing,
-            Clip = _detailClip,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            RenderTransform = _expandedTransform,
+            Clip = _expandedClip,
+            IsHitTestVisible = false,
         };
+        _expandedLayer.Children.Add(_singleRowPanel);
+        _expandedLayer.Children.Add(_twoRowOuterPanel);
+        _expandedLayer.Children.Add(_emptyCard);
 
-        for (var i = 0; i < MaxRows; i++)
+        _ringRoot = new Grid
         {
-            var row = new DeviceRow(_textBrush, _mutedBrush, _faintBrush, _trackBrush, "\uE7F8");
-            _rows.Add(row);
-            _detail.Children.Add(row.Root);
-        }
-
-        // Spacing 留 0：头行与展开区之间的间距由 _detail 的上外边距按展开进度给，
-        // 这样紧凑态下不会白留一段 8px 的空白（否则 40px 高的紧凑卡片会被裁掉一截）。
-        var root = new StackPanel
-        {
-            Spacing = 0,
-            Padding = new Thickness(16, RootPaddingTop, 16, RootPaddingBottom),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        root.Children.Add(_header.Root);
-        root.Children.Add(_detail);
+        _ringRoot.Children.Add(_compactLayer);
+        _ringRoot.Children.Add(_expandedLayer);
 
-        Content = root;
+        _classicView = new ClassicBatteryIslandView(manifest, theme)
+        {
+            Visibility = Visibility.Collapsed,
+        };
+
+        var host = new Grid
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        host.Children.Add(_ringRoot);
+        host.Children.Add(_classicView);
+
+        Content = host;
+
+        ApplyThemeColors();
+        _theme.Changed += ApplyThemeColors;
 
         _morphTimer = DispatcherQueue?.CreateTimer();
         if (_morphTimer is not null)
         {
-            _morphTimer.Interval = TimeSpan.FromMilliseconds(16);
+            _morphTimer.Interval = TimeSpan.FromMilliseconds(8);
             _morphTimer.IsRepeating = true;
             _morphTimer.Tick += (_, _) => OnMorphTick();
         }
@@ -132,82 +266,175 @@ public sealed class BatteryIslandView : UserControl, IMorphView
 
     public UIElement View => this;
 
-    /// <summary>展开态想要的高度：头行 + 实际用到的行数，不超过上限。</summary>
-    public double DesiredExpandedHeight =>
-        RootPaddingTop + RootPaddingBottom + RowHeight + HeaderDetailSpacing + _expandedDetailHeight;
+    public double DesiredCompactWidth => _activeStyle == BatteryUiStyle.ClassicList
+        ? ClassicBatteryIslandView.CompactWidth
+        : _desiredCompactWidth;
 
-    /// <summary>把一轮采集结果刷到界面上。列表已按告急程度排好序，第一台进头行。</summary>
-    public void UpdateDevices(IReadOnlyList<DeviceBattery> devices, int threshold)
+    public double DesiredExpandedWidth => _activeStyle == BatteryUiStyle.ClassicList
+        ? ClassicBatteryIslandView.ExpandedWidth
+        : _desiredExpandedWidth;
+
+    public double DesiredExpandedHeight => _activeStyle == BatteryUiStyle.ClassicList
+        ? _classicView.DesiredExpandedHeight
+        : _desiredExpandedHeight;
+
+    public Action<string>? Diagnose
     {
-        if (devices.Count == 0)
-        {
-            _header.SetEmpty("未发现外设");
-            for (var i = 0; i < _rows.Count; i++) _rows[i].Set(null, threshold);
+        get => _classicView.Diagnose;
+        set => _classicView.Diagnose = value;
+    }
 
-            _visibleRowCount = 0;
-            _expandedDetailHeight = 0;
-            if (_progress > 0) ApplyMorph(_progress);
-            return;
+    /// <summary>把最新一轮采集到的设备与布局设置刷到胶囊和展开卡片上。</summary>
+    public void UpdateDevices(
+        IReadOnlyList<DeviceBattery> devices,
+        int threshold,
+        bool useTypeIcons,
+        BatteryUiStyle uiStyle,
+        bool cardTwoRows,
+        int cardMaxCount,
+        int capsuleMaxCount)
+    {
+        _activeStyle = uiStyle;
+        _ringRoot.Visibility = uiStyle == BatteryUiStyle.Ring ? Visibility.Visible : Visibility.Collapsed;
+        _classicView.Visibility = uiStyle == BatteryUiStyle.ClassicList ? Visibility.Visible : Visibility.Collapsed;
+
+        // 同步更新旧版经典列表树，切换风格时无需等待下一轮采集即可立即生效
+        _classicView.UpdateDevices(devices, threshold, useTypeIcons);
+        // 1. 胶囊态更新
+        var capsuleLimit = Math.Clamp(capsuleMaxCount, 1, MaxCapsuleSlots);
+        var capsuleShown = Math.Min(devices.Count, capsuleLimit);
+
+        if (capsuleShown == 0)
+        {
+            _capsuleGauges[0].Root.Visibility = Visibility.Visible;
+            _capsuleGauges[0].Update(null, threshold, useTypeIcons, _fallbackGlyph);
+            for (var i = 1; i < MaxCapsuleSlots; i++)
+            {
+                _capsuleGauges[i].Root.Visibility = Visibility.Collapsed;
+            }
+
+            _desiredCompactWidth = 110;
+        }
+        else
+        {
+            for (var i = 0; i < MaxCapsuleSlots; i++)
+            {
+                if (i < capsuleShown)
+                {
+                    _capsuleGauges[i].Root.Visibility = Visibility.Visible;
+                    _capsuleGauges[i].Update(devices[i], threshold, useTypeIcons, _fallbackGlyph);
+                }
+                else
+                {
+                    _capsuleGauges[i].Root.Visibility = Visibility.Collapsed;
+                }
+            }
+
+            var rowWidth = capsuleShown * (CapsuleGaugeDiameter + 4) + (capsuleShown - 1) * CapsuleItemSpacing;
+            _desiredCompactWidth = Math.Max(110, rowWidth + 28);
         }
 
-        _header.Set(devices[0], threshold);
+        // 2. 展开卡片态更新
+        var cardLimit = Math.Clamp(cardMaxCount, 1, MaxCardSlots);
+        var cardShown = Math.Min(devices.Count, cardLimit);
 
-        var used = 0;
-        for (var i = 0; i < _rows.Count; i++)
+        if (cardShown == 0)
         {
-            // 头行已经显示 devices[0]，展开行从第二台开始，一直排到塞不下为止
-            var index = i + 1;
-            var device = index < devices.Count ? devices[index] : null;
-            _rows[i].Set(device, threshold);
-            if (device is not null) used++;
+            _emptyCard.Visibility = Visibility.Visible;
+            _singleRowPanel.Visibility = Visibility.Collapsed;
+            _twoRowOuterPanel.Visibility = Visibility.Collapsed;
+
+            _desiredExpandedWidth = 340;
+            _desiredExpandedHeight = 110;
+        }
+        else if (!cardTwoRows)
+        {
+            _emptyCard.Visibility = Visibility.Collapsed;
+            _singleRowPanel.Visibility = Visibility.Visible;
+            _twoRowOuterPanel.Visibility = Visibility.Collapsed;
+
+            for (var i = 0; i < MaxCardSlots; i++)
+            {
+                if (i < cardShown)
+                {
+                    _singleRowCards[i].Set(devices[i], threshold, useTypeIcons, _fallbackGlyph);
+                }
+                else
+                {
+                    _singleRowCards[i].Set(null, threshold, useTypeIcons, _fallbackGlyph);
+                }
+            }
+
+            var contentWidth = cardShown * SingleRowCardWidth + (cardShown - 1) * SingleRowSpacing;
+            _desiredExpandedWidth = Math.Max(396, contentWidth + 28);
+            _desiredExpandedHeight = SingleRowCardHeight + SingleRowPaddingY * 2;
+        }
+        else
+        {
+            _emptyCard.Visibility = Visibility.Collapsed;
+            _singleRowPanel.Visibility = Visibility.Collapsed;
+            _twoRowOuterPanel.Visibility = Visibility.Visible;
+
+            // 双行布局：当显示设备 >= 2 台时，自动均分到上下两行；每行最多 6 个
+            var topCount = cardShown <= 1 ? cardShown : (int)Math.Ceiling(cardShown / 2.0);
+            var bottomCount = cardShown - topCount;
+
+            _twoRowTopPanel.Children.Clear();
+            _twoRowBottomPanel.Children.Clear();
+
+            for (var i = 0; i < topCount; i++)
+            {
+                _twoRowCards[i].Set(devices[i], threshold, useTypeIcons, _fallbackGlyph);
+                _twoRowTopPanel.Children.Add(_twoRowCards[i].Root);
+            }
+
+            for (var i = 0; i < bottomCount; i++)
+            {
+                var idx = topCount + i;
+                _twoRowCards[idx].Set(devices[idx], threshold, useTypeIcons, _fallbackGlyph);
+                _twoRowBottomPanel.Children.Add(_twoRowCards[idx].Root);
+            }
+
+            _twoRowBottomPanel.Visibility = bottomCount > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+            var cols = Math.Max(1, topCount);
+            var contentWidth = cols * TwoRowCardWidth + (cols - 1) * TwoRowSpacing;
+            _desiredExpandedWidth = Math.Max(360, contentWidth + 28);
+            _desiredExpandedHeight = bottomCount > 0
+                ? TwoRowCardHeight * 2 + TwoRowSpacing + TwoRowPaddingY * 2
+                : TwoRowCardHeight + TwoRowPaddingY * 2;
         }
 
-        _visibleRowCount = used;
-        _expandedDetailHeight = used == 0
-            ? 0
-            : used * RowHeight + (used - 1) * RowSpacing;
-
-        if (_progress > 0) ApplyMorph(_progress);
+        if (_progress > 0)
+        {
+            ApplyMorph(_progress, _progress);
+        }
     }
 
-    private static Windows.UI.Color ColorFor(DeviceBattery device, int threshold)
+    public void AnimateToExpanded(TimeSpan duration)
     {
-        if (device.Charging == true) return ChargingColor;
-        if (device.Level is { } level && level <= threshold) return LowColor;
-        return AccentColor;
+        _classicView.AnimateToExpanded(duration);
+        StartMorph(1, duration);
     }
 
-    public void AnimateToExpanded(TimeSpan duration) => StartMorph(1, duration);
-
-    public void AnimateToCompact(TimeSpan duration) => StartMorph(0, duration);
-
-    /// <summary>诊断钩子：宿主每次要求展开/收起时记一笔，便于在插件日志里确认卡片真的被显示了。</summary>
-    public Action<string>? Diagnose { get; set; }
-
-    private void ApplyThemeColors()
+    public void AnimateToCompact(TimeSpan duration)
     {
-        _textBrush.Color = Neutral(255);
-        _mutedBrush.Color = Neutral(200);
-        _faintBrush.Color = Neutral(150);
-        _trackBrush.Color = Neutral(38);
+        _classicView.AnimateToCompact(duration);
+        StartMorph(0, duration);
     }
-
-    private Windows.UI.Color Neutral(byte alpha) => _theme.IsLight
-        ? Windows.UI.Color.FromArgb(alpha, 0, 0, 0)
-        : Windows.UI.Color.FromArgb(alpha, 255, 255, 255);
 
     private void StartMorph(double target, TimeSpan duration)
     {
         _morphFrom = _progress;
         _morphTarget = target;
         _morphDuration = duration > TimeSpan.Zero ? duration : TimeSpan.FromMilliseconds(1);
-        _morphStart = DateTimeOffset.UtcNow;
+        _morphStartTicks = Stopwatch.GetTimestamp();
 
-        Diagnose?.Invoke($"morph → {target:0.##}（{duration.TotalMilliseconds:0}ms，{_visibleRowCount + 1} 台，高 {DesiredExpandedHeight:0.#}）");
+        Diagnose?.Invoke($"morph → {target:0.##}（{duration.TotalMilliseconds:0}ms，宽 {_desiredExpandedWidth:0.#}，高 {_desiredExpandedHeight:0.#}）");
 
         if (_morphTimer is null)
         {
-            ApplyMorph(target);
+            ApplyMorph(target, target);
             return;
         }
 
@@ -216,207 +443,155 @@ public sealed class BatteryIslandView : UserControl, IMorphView
 
     private void OnMorphTick()
     {
-        var elapsed = (DateTimeOffset.UtcNow - _morphStart).TotalMilliseconds;
+        var elapsed = Stopwatch.GetElapsedTime(_morphStartTicks).TotalMilliseconds;
         var durationMs = Math.Max(1, _morphDuration.TotalMilliseconds);
         var t = Math.Clamp(elapsed / durationMs, 0, 1);
 
-        ApplyMorph(_morphFrom + (_morphTarget - _morphFrom) * BackEaseOut(t));
+        var linear = _morphFrom + (_morphTarget - _morphFrom) * t;
+        var eased = _morphFrom + (_morphTarget - _morphFrom) * BackEaseOut(t);
+        ApplyMorph(linear, eased);
 
         if (t >= 1)
         {
             _morphTimer?.Stop();
-            ApplyMorph(_morphTarget);
+            ApplyMorph(_morphTarget, _morphTarget);
         }
     }
 
-    /// <summary>BackEase(EaseOut, A) = 1 + (A+1)(t-1)^3 + A(t-1)^2。</summary>
     private static double BackEaseOut(double t)
     {
         var d = t - 1;
         return 1 + (BackAmplitude + 1) * d * d * d + BackAmplitude * d * d;
     }
 
-    private void ApplyMorph(double progress)
+    private static double EaseOutCubic(double t)
     {
-        _progress = progress;
-
-        var height = Math.Max(0, _expandedDetailHeight * progress);
-        _detail.Height = height;
-        _detail.Opacity = Math.Clamp(progress, 0, 1);
-
-        // 头行与展开区之间的呼吸间距也跟着展开进度长出来，紧凑态不占位
-        var p = Math.Clamp(progress, 0, 1);
-        _detail.Margin = new Thickness(0, HeaderDetailSpacing * p, 0, 0);
-
-        // 高度在动画中会小于内容高度，纵向裁掉溢出的行（宽度给足，只裁 Y）
-        _detailClip.Rect = new Windows.Foundation.Rect(0, 0, 10000, height);
-
-        // 首行的来源标签在紧凑态收起，展开时平滑长出来；字号全程不变，和下面各行对齐
-        _header.SetMetaReveal(progress);
-
-        // 展开行本来只在展开态可见，但它们构造时 MaxWidth 也是 0，
-        // 必须同样跟着进度长出来 —— 否则只有首行有「蓝牙」，下面各行永远是空标签。
-        for (var i = 0; i < _rows.Count; i++) _rows[i].SetMetaReveal(progress);
+        var d = 1 - Math.Clamp(t, 0, 1);
+        return 1 - d * d * d;
     }
 
-    /// <summary>一行设备：图标 + 名称 + 来源 + 迷你电量条 + 百分比。首行与展开行完全同款。</summary>
-    private sealed class DeviceRow
+    private void ApplyMorph(double linear, double eased)
     {
-        private readonly FontIcon _glyph;
-        private readonly TextBlock _name;
-        private readonly TextBlock _meta;
-        private readonly TextBlock _level;
-        private readonly Border _trackBorder;
-        private readonly Border _fill;
-        private readonly ColumnDefinition _fillColumn;
-        private readonly ColumnDefinition _restColumn;
-        private readonly SolidColorBrush _text;
-        private readonly SolidColorBrush _muted;
-        private readonly SolidColorBrush _faint;
-        private readonly SolidColorBrush _track;
-        private readonly string _fallbackGlyph;
+        _progress = Math.Clamp(linear, 0, 1);
 
-        public DeviceRow(SolidColorBrush text, SolidColorBrush muted, SolidColorBrush faint, SolidColorBrush track, string fallbackGlyph)
+        // 胶囊层：展开前 32% 快速淡出上移，收起最后 32% 平滑淡入归位
+        var compactAlpha = 1.0 - EaseOutCubic(Math.Clamp(_progress / 0.32, 0, 1));
+        _compactLayer.Opacity = compactAlpha;
+        _compactTransform.Y = -6 * (1 - compactAlpha);
+        _compactLayer.IsHitTestVisible = _progress < 0.5;
+
+        // 展开卡片层：高度跟宿主 BackEase 同步展开，透明度从 18% 处单调淡入
+        var expAlpha = EaseOutCubic(Math.Clamp((_progress - 0.18) / 0.82, 0, 1));
+        var expHeight = Math.Max(0, _desiredExpandedHeight * eased);
+        _expandedLayer.Height = expHeight;
+        _expandedLayer.Opacity = expAlpha;
+        _expandedTransform.Y = 6 * (1 - expAlpha);
+        _expandedClip.Rect = new Windows.Foundation.Rect(0, 0, 10000, expHeight);
+        _expandedLayer.IsHitTestVisible = _progress >= 0.5;
+    }
+
+    private void ApplyThemeColors()
+    {
+        var light = _theme.IsLight;
+        _textBrush.Color = Neutral(255);
+        _mutedBrush.Color = Neutral(195);
+        _faintBrush.Color = Neutral(140);
+        _trackBrush.Color = Neutral(light ? (byte)36 : (byte)44);
+
+        // 方圆形独立容器：浅色岛上用柔和白灰底，深色岛上用微亮玻璃底
+        _cardBgBrush.Color = light
+            ? Windows.UI.Color.FromArgb(20, 0, 0, 0)
+            : Windows.UI.Color.FromArgb(24, 255, 255, 255);
+        _cardBorderBrush.Color = light
+            ? Windows.UI.Color.FromArgb(26, 0, 0, 0)
+            : Windows.UI.Color.FromArgb(32, 255, 255, 255);
+
+        var islandHalo = light
+            ? Windows.UI.Color.FromArgb(255, 242, 242, 247)
+            : Windows.UI.Color.FromArgb(255, 28, 28, 30);
+
+        var cardHalo = light
+            ? Windows.UI.Color.FromArgb(255, 234, 234, 240)
+            : Windows.UI.Color.FromArgb(255, 42, 42, 46);
+
+        foreach (var g in _capsuleGauges) g.SetHaloColor(islandHalo);
+        foreach (var c in _singleRowCards) c.SetHaloColor(cardHalo);
+        foreach (var c in _twoRowCards) c.SetHaloColor(cardHalo);
+    }
+
+    private Windows.UI.Color Neutral(byte alpha) => _theme.IsLight
+        ? Windows.UI.Color.FromArgb(alpha, 0, 0, 0)
+        : Windows.UI.Color.FromArgb(alpha, 255, 255, 255);
+
+    /// <summary>单个设备的独立方圆形容器：圆弧电量表盘 + 底部设备名。</summary>
+    private sealed class SquircleDeviceCard
+    {
+        private readonly BatteryArcGauge _gauge;
+        private readonly TextBlock _nameText;
+
+        public SquircleDeviceCard(
+            double cardWidth,
+            double cardHeight,
+            double cornerRadius,
+            double gaugeDiameter,
+            double strokeThickness,
+            double iconFontSize,
+            double percentFontSize,
+            double nameFontSize,
+            double nameTopMargin,
+            Thickness cardPadding,
+            Brush textBrush,
+            Brush trackBrush,
+            Brush cardBgBrush,
+            Brush cardBorderBrush)
         {
-            _text = text;
-            _muted = muted;
-            _faint = faint;
-            _track = track;
-            _fallbackGlyph = fallbackGlyph;
+            _gauge = new BatteryArcGauge(
+                diameter: gaugeDiameter,
+                strokeThickness: strokeThickness,
+                iconFontSize: iconFontSize,
+                percentFontSize: percentFontSize,
+                textBrush: textBrush,
+                trackBrush: trackBrush);
 
-            _glyph = new FontIcon
+            _nameText = new TextBlock
             {
-                Glyph = fallbackGlyph,
-                FontSize = RowIconSize,
-                Width = RowIconSlot,
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = _muted,
-            };
-
-            _name = new TextBlock
-            {
-                FontSize = RowTitleSize,
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = _text,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-            };
-
-            _meta = new TextBlock
-            {
-                FontSize = RowMetaSize,
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = _faint,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                MaxWidth = 0,
-                Opacity = 0,
-            };
-
-            _fillColumn = new ColumnDefinition { Width = new GridLength(0.01, GridUnitType.Star) };
-            _restColumn = new ColumnDefinition { Width = new GridLength(99.99, GridUnitType.Star) };
-
-            _fill = new Border
-            {
-                Background = new SolidColorBrush(AccentColor),
-                CornerRadius = new CornerRadius(BarHeight / 2),
+                FontSize = nameFontSize,
+                FontWeight = FontWeights.Medium,
+                Foreground = textBrush,
+                TextAlignment = TextAlignment.Center,
                 HorizontalAlignment = HorizontalAlignment.Stretch,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                MaxLines = 1,
+                Margin = new Thickness(0, nameTopMargin, 0, 0),
             };
-            Grid.SetColumn(_fill, 0);
 
-            var bar = new Grid { Height = BarHeight, Width = RowBarWidth, VerticalAlignment = VerticalAlignment.Center };
-            bar.ColumnDefinitions.Add(_fillColumn);
-            bar.ColumnDefinitions.Add(_restColumn);
-            bar.Children.Add(_fill);
-
-            _trackBorder = new Border
+            var stack = new StackPanel
             {
-                Background = _track,
-                CornerRadius = new CornerRadius(BarHeight / 2),
-                Height = BarHeight,
-                Width = RowBarWidth,
+                Orientation = Orientation.Vertical,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
                 VerticalAlignment = VerticalAlignment.Center,
-                Child = bar,
             };
+            stack.Children.Add(_gauge.Root);
+            stack.Children.Add(_nameText);
 
-            _level = new TextBlock
+            Root = new Border
             {
-                FontSize = RowLevelSize,
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = _muted,
-                // 固定宽度 + 右对齐：MinWidth 会让 "70%" 和 "100%" 各按内容宽度撑开，
-                // 两行的右边缘就差了半个字符。必须锁死列宽才能右对齐。
-                Width = RowLevelSlot,
-                TextAlignment = TextAlignment.Right,
+                Width = cardWidth,
+                Height = cardHeight,
+                CornerRadius = new CornerRadius(cornerRadius),
+                Background = cardBgBrush,
+                BorderBrush = cardBorderBrush,
+                BorderThickness = new Thickness(1),
+                Padding = cardPadding,
+                Child = stack,
             };
-
-            // 必须用 Grid 而不是横向 StackPanel：横向 StackPanel 会用无限宽测量子元素，
-            // 设备名永远不会触发 trimming，整行宽度随名字长短变化，把右侧的百分比推得各行不齐
-            // （实测"浓韵"行 70% 右边缘 425，"VXE Mouse 1K Dongle"行 100% 右边缘 457）。
-            //
-            // 列序：图标 | 名称 | 来源 | 弹性空白 | 电量条 | 百分比
-            // 名称用 Auto + MaxWidth 而不是 Star：Star 会把名称框拉满整列，短名字后面留一大段空白，
-            // 来源标签被推到很右边，和没来源标签的行看起来完全不是一套排版。
-            var line = new Grid { VerticalAlignment = VerticalAlignment.Center };
-            line.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });                     // 0 图标
-            line.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });                     // 1 名称
-            line.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });                     // 2 来源
-            line.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // 3 弹性空白
-
-            _name.MaxWidth = RowNameMaxWidth;
-            _name.Margin = new Thickness(6, 0, 0, 0);
-            _meta.Margin = new Thickness(6, 0, 0, 0);
-
-            Grid.SetColumn(_glyph, 0);
-            Grid.SetColumn(_name, 1);
-            Grid.SetColumn(_meta, 2);
-            line.Children.Add(_glyph);
-            line.Children.Add(_name);
-            line.Children.Add(_meta);
-
-            var grid = new Grid { Height = RowHeight };
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            // 电量条与百分比之间留一点气口，不然条尾直接顶着数字
-            _trackBorder.Margin = new Thickness(0, 0, 8, 0);
-
-            Grid.SetColumn(line, 0);
-            Grid.SetColumn(_trackBorder, 1);
-            Grid.SetColumn(_level, 2);
-            grid.Children.Add(line);
-            grid.Children.Add(_trackBorder);
-            grid.Children.Add(_level);
-
-            Root = grid;
         }
 
-        public Grid Root { get; }
+        public Border Root { get; }
 
-        /// <summary>紧凑态把来源标签收起来（宽度归零），展开时按进度长出来。</summary>
-        public void SetMetaReveal(double progress)
-        {
-            var p = Math.Clamp(progress, 0, 1);
-            _meta.MaxWidth = 120 * p;
-            _meta.Opacity = p;
-        }
+        public void SetHaloColor(Windows.UI.Color haloColor) => _gauge.SetHaloColor(haloColor);
 
-        public void SetEmpty(string text)
-        {
-            Root.Visibility = Visibility.Visible;
-            _glyph.Glyph = _fallbackGlyph;
-            _glyph.Foreground = _muted;
-            _name.Text = text;
-            _name.Foreground = _muted;
-            _meta.Text = "";
-            _meta.MaxWidth = 0;
-            _meta.Opacity = 0;
-            _level.Text = "";
-            _level.Foreground = _muted;
-            _trackBorder.Visibility = Visibility.Collapsed;
-            SetBarFraction(0, _muted);
-        }
-
-        public void Set(DeviceBattery? device, int threshold)
+        public void Set(DeviceBattery? device, int threshold, bool useTypeIcons, string fallbackGlyph)
         {
             if (device is null)
             {
@@ -425,28 +600,20 @@ public sealed class BatteryIslandView : UserControl, IMorphView
             }
 
             Root.Visibility = Visibility.Visible;
-            _trackBorder.Visibility = Visibility.Visible;
+            _gauge.Update(device, threshold, useTypeIcons, fallbackGlyph);
+            _nameText.Text = device.Name;
 
-            _glyph.Glyph = device.Glyph;
-            _name.Text = device.Name;
-            _name.Foreground = _text;
-            _meta.Text = device.LinkLabel;
-            _level.Text = device.LevelText;
-
-            var color = ColorFor(device, threshold);
-            var brush = new SolidColorBrush(color);
-            _glyph.Foreground = brush;
-            _level.Foreground = brush;
-
-            SetBarFraction(Math.Clamp(device.Level ?? 0, 0, 100), brush);
-        }
-
-        private void SetBarFraction(double level, Brush brush)
-        {
-            var clamped = Math.Clamp(level, 0, 100);
-            _fillColumn.Width = new GridLength(Math.Max(0.01, clamped), GridUnitType.Star);
-            _restColumn.Width = new GridLength(Math.Max(0.01, 100 - clamped), GridUnitType.Star);
-            _fill.Background = brush;
+            var linkDesc = device.Link switch
+            {
+                PeripheralLink.Usb24G => "2.4G连接",
+                PeripheralLink.Bluetooth or PeripheralLink.BluetoothLE => "蓝牙连接",
+                PeripheralLink.Wired => "有线连接",
+                _ => "未知连接",
+            };
+            var tooltip = device.Charging == true
+                ? $"连接方式：{linkDesc}\n充电中"
+                : $"连接方式：{linkDesc}";
+            ToolTipService.SetToolTip(Root, tooltip);
         }
     }
 }

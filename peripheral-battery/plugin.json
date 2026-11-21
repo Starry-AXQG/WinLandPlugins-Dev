@@ -1,7 +1,7 @@
 {
   "id": "peripheral-battery",
   "name": "外设电量",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "entry_dll": "PeripheralBattery.dll",
   "api_version": 2,
   "min_host_version": "2.4.0",

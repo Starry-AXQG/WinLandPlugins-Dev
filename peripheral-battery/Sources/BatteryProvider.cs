@@ -133,7 +133,10 @@ internal sealed class BatteryProvider
         return result;
     }
 
-    /// <summary>去重时的优先级：2.4G 直读 &gt; 蓝牙 LE &gt; 蓝牙。</summary>
+    /// <summary>
+    /// 去重时的优先级：实时在线通道一律优先于休眠/缓存快照；同为实时通道时 2.4G 直读 &gt; 蓝牙 LE &gt; 蓝牙。
+    /// 这样当 2.4G 外设在不拔接收器的情况下切到蓝牙模式时，2.4G 的休眠缓存（Stale=true）会让位给实时蓝牙连接。
+    /// </summary>
     private static int Rank(DeviceBattery item)
     {
         var score = item.Link switch
@@ -144,7 +147,7 @@ internal sealed class BatteryProvider
             _ => 0,
         };
 
-        if (item.Stale) score -= 5;
+        if (item.Stale) score -= 25;
         if (item.Level is null) score -= 10;
         return score;
     }

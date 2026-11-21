@@ -1,0 +1,66 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>MediaDeck</RootNamespace>
+    <AssemblyName>MediaDeck</AssemblyName>
+    <Platforms>x86;x64;ARM64</Platforms>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>false</WinUISDKReferences>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>false</EnableMsixTooling>
+
+    <!-- 自带第三方 NuGet 依赖（NAudio.Wasapi 等），必须开启以复制到插件目录 -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+
+    <!-- 宿主的 plugins 目录：构建完成后自动部署到用户平时使用的 WinIsland -->
+    <WinIslandPluginsDir Condition="'$(WinIslandPluginsDir)' == ''">$(LocalAppData)\Programs\WinIsland\plugins</WinIslandPluginsDir>
+    <PluginTargetDir>$(WinIslandPluginsDir)\media-deck</PluginTargetDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 插件 SDK（宿主提供，不打进插件包） -->
+    <PackageReference Include="luolan.winland.Core" Version="2.4.0" PrivateAssets="all" ExcludeAssets="runtime" />
+
+    <!-- Windows App SDK / WinUI 运行时（宿主提供，不打进插件包） -->
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2526" PrivateAssets="all" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" PrivateAssets="all" ExcludeAssets="runtime" />
+
+    <!-- Windows Core Audio API 封装：输出设备枚举、热插拔监听、音量合成器 -->
+    <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="plugin.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- 构建后自动拷进宿主 plugins\media-deck\（排除宿主自带运行时） -->
+  <Target Name="CopyToWinIsland" AfterTargets="Build">
+    <ItemGroup>
+      <PluginArtifacts Include="$(OutDir)**\*.*" />
+      <PluginArtifacts Remove="$(OutDir)WinIsland.Core.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.WinUI.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Windows.SDK.NET.dll" />
+      <PluginArtifacts Remove="$(OutDir)WinRT.Runtime.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Windows.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Web.WebView2*.dll" />
+      <PluginArtifacts Remove="$(OutDir)WebView2Loader.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.Graphics.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.InteractiveExperiences.*.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.*.Projection.dll" />
+      <PluginArtifacts Remove="$(OutDir)Microsoft.WindowsAppRuntime*" />
+      <PluginArtifacts Remove="$(OutDir)**\*.pdb" />
+    </ItemGroup>
+    <MakeDir Directories="$(PluginTargetDir)" />
+    <Copy
+      SourceFiles="@(PluginArtifacts)"
+      DestinationFiles="@(PluginArtifacts->'$(PluginTargetDir)\%(RecursiveDir)%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

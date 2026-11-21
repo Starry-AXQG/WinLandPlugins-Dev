@@ -95,8 +95,8 @@ internal sealed class VxeDeviceSource : IDeviceSource
             {
                 if (_lastKnownByProduct.TryGetValue(productKey, out var cachedOnTimeout))
                 {
-                    context.Debug($"{Brand}：在线查询超时，沿用最近一次已知电量={cachedOnTimeout.Level}%");
-                    result.Add(cachedOnTimeout);
+                    context.Debug($"{Brand}：在线查询超时，沿用最近一次已知电量={cachedOnTimeout.Level}%（标记为缓存）");
+                    result.Add(cachedOnTimeout.AsStale());
                     seenProducts.Add(productKey);
                 }
                 else
@@ -111,8 +111,8 @@ internal sealed class VxeDeviceSource : IDeviceSource
             {
                 if (_lastKnownByProduct.TryGetValue(productKey, out var cachedOnSleep))
                 {
-                    context.Debug($"{Brand}：无线鼠标处于省电休眠（onlineStatus={onlineResp[6]}），保持休眠前电量={cachedOnSleep.Level}%");
-                    result.Add(cachedOnSleep);
+                    context.Debug($"{Brand}：无线鼠标处于省电休眠或已切换模式（onlineStatus={onlineResp[6]}），暂留休眠前电量={cachedOnSleep.Level}%（标记为缓存）");
+                    result.Add(cachedOnSleep.AsStale());
                     seenProducts.Add(productKey);
                 }
                 else
@@ -135,8 +135,8 @@ internal sealed class VxeDeviceSource : IDeviceSource
             {
                 if (_lastKnownByProduct.TryGetValue(productKey, out var cachedOnBatFail))
                 {
-                    context.Debug($"{Brand}：电量查询偶发未响应，沿用最近一次已知电量={cachedOnBatFail.Level}%");
-                    result.Add(cachedOnBatFail);
+                    context.Debug($"{Brand}：电量查询偶发未响应，沿用最近一次已知电量={cachedOnBatFail.Level}%（标记为缓存）");
+                    result.Add(cachedOnBatFail.AsStale());
                     seenProducts.Add(productKey);
                 }
                 else
@@ -154,8 +154,8 @@ internal sealed class VxeDeviceSource : IDeviceSource
             {
                 if (_lastKnownByProduct.TryGetValue(productKey, out var cachedOnInvalid))
                 {
-                    context.Debug($"{Brand}：返回电量瞬态无效 level={level}，沿用最近一次已知电量={cachedOnInvalid.Level}%");
-                    result.Add(cachedOnInvalid);
+                    context.Debug($"{Brand}：返回电量瞬态无效 level={level}，沿用最近一次已知电量={cachedOnInvalid.Level}%（标记为缓存）");
+                    result.Add(cachedOnInvalid.AsStale());
                     seenProducts.Add(productKey);
                 }
                 else

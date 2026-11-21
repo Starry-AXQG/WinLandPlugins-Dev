@@ -114,8 +114,8 @@ internal sealed class MchoseDeviceSource : IDeviceSource
             {
                 if (_lastKnownByProduct.TryGetValue(key, out var cachedOnTimeout))
                 {
-                    context.Debug($"{Brand}：GLW getFuncConfig 偶发超时，沿用最近一次已知电量={cachedOnTimeout.Level}%");
-                    result.Add(cachedOnTimeout);
+                    context.Debug($"{Brand}：GLW getFuncConfig 偶发超时，沿用最近一次已知电量={cachedOnTimeout.Level}%（标记为缓存）");
+                    result.Add(cachedOnTimeout.AsStale());
                 }
                 else
                 {
@@ -128,8 +128,8 @@ internal sealed class MchoseDeviceSource : IDeviceSource
             {
                 if (_lastKnownByProduct.TryGetValue(key, out var cachedOnSleep))
                 {
-                    context.Debug($"{Brand}：键盘处于省电休眠（FA FB 06 00），保持休眠前电量={cachedOnSleep.Level}%");
-                    result.Add(cachedOnSleep);
+                    context.Debug($"{Brand}：键盘处于省电休眠或已切换模式（FA FB 06 00），暂留休眠前电量={cachedOnSleep.Level}%（标记为缓存）");
+                    result.Add(cachedOnSleep.AsStale());
                 }
                 else
                 {
@@ -150,8 +150,8 @@ internal sealed class MchoseDeviceSource : IDeviceSource
             {
                 if (_lastKnownByProduct.TryGetValue(key, out var cachedOnInvalid))
                 {
-                    context.Debug($"{Brand}：GLW 返回电量瞬态无效 raw=0x{rawBattery:X2}，沿用最近一次已知电量={cachedOnInvalid.Level}%");
-                    result.Add(cachedOnInvalid);
+                    context.Debug($"{Brand}：GLW 返回电量瞬态无效 raw=0x{rawBattery:X2}，沿用最近一次已知电量={cachedOnInvalid.Level}%（标记为缓存）");
+                    result.Add(cachedOnInvalid.AsStale());
                 }
                 else
                 {

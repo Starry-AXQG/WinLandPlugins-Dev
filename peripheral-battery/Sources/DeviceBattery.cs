@@ -48,8 +48,23 @@ public sealed class DeviceBattery
     /// <summary>数据来源说明（界面上标注，例如 MCHOSE HUB 的缓存）。</summary>
     public string Source { get; init; } = "";
 
-    /// <summary>数据可能不是最新的（例如缓存文件很久没更新）。</summary>
+    /// <summary>数据可能不是最新的（例如缓存文件很久没更新，或 2.4G 休眠/离线沿用的快照）。</summary>
     public bool Stale { get; init; }
+
+    /// <summary>返回一个标记为缓存/陈旧状态的副本，便于去重时让位于实时在线通道。</summary>
+    public DeviceBattery AsStale() => Stale
+        ? this
+        : new DeviceBattery
+        {
+            Id = Id,
+            Name = Name,
+            Level = Level,
+            Charging = Charging,
+            Kind = Kind,
+            Link = Link,
+            Source = Source,
+            Stale = true,
+        };
 
     public string LinkLabel => Link switch
     {

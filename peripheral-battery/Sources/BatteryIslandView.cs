@@ -261,7 +261,22 @@ public sealed class BatteryIslandView : UserControl, IMorphView
             _morphTimer.Tick += (_, _) => OnMorphTick();
         }
 
-        Unloaded += (_, _) => _morphTimer?.Stop();
+        // 视图在主岛 ContentHost、ContentLeaving 与队列卡片 QueuePanel 之间搬家时会异步触发 Unloaded：
+        // 若此刻视图已重新挂回可视树（IsLoaded == true），绝不能停掉正在运行的形态动画定时器；
+        // 即使真的从可视树卸下，也必须立刻把形态直接锁定到目标终态，防止残留在半透明或位移中间帧。
+        Loaded += (_, _) =>
+        {
+            if (Math.Abs(_progress - _morphTarget) > 0.001 && _morphTimer is { IsRunning: false })
+            {
+                _morphTimer.Start();
+            }
+        };
+        Unloaded += (_, _) =>
+        {
+            if (IsLoaded) return;
+            _morphTimer?.Stop();
+            ApplyMorph(_morphTarget, _morphTarget);
+        };
     }
 
     public UIElement View => this;

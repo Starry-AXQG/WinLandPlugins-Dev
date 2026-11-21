@@ -38,6 +38,16 @@
     <None Update="README.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!-- docs/ 只是 README 用的截图，logo.png 只给市场用：都不参与构建，也不能被打进 .lwp -->
+  <ItemGroup>
+    <Content Remove="docs\**" />
+    <None Remove="docs\**" />
+    <None Include="docs\**" CopyToOutputDirectory="Never" />
+    <Content Remove="logo.png" />
+    <None Remove="logo.png" />
+    <None Include="logo.png" CopyToOutputDirectory="Never" />
+  </ItemGroup>
+
   <!-- 构建后：把插件文件拷进宿主 plugins\hw-sensors\（宿主自带运行时文件不拷） -->
   <!-- 宿主正在运行时会锁住插件 dll，需要先关掉宿主：deploy.ps1 会自己处理 -->
   <Target Name="CopyToWinIsland" AfterTargets="Build" Condition="'$(SkipDeploy)' != 'true'">

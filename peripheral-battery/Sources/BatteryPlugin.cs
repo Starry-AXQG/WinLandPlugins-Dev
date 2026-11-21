@@ -51,10 +51,7 @@ public sealed class BatteryPlugin : IslandPluginBase
 
         _content = new IslandLiveContent
         {
-            // 小岛常驻不跟硬件监控抢（Priority 低一点），但一展开就排最前，
-            // 这样悬停展开看到的第一张卡就是「按告急程度排序的外设列表」。
             Priority = _settings.Priority,
-            ExpandedPriority = PluginSettings.ExpandedPriority,
             OwnerLabel = Manifest.Name,
             OwnerGlyph = Manifest.IconGlyph,
             OwnerAccent = Windows.UI.Color.FromArgb(255, 76, 194, 255),

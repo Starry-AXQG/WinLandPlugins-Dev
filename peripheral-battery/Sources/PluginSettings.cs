@@ -37,12 +37,6 @@ internal sealed class PluginSettings
     public const int DefaultCardMaxCount = 4;
     public const int DefaultCapsuleMaxCount = 3;
 
-    /// <summary>
-    /// 展开优先级固定拉高：悬停展开时这张卡要排在最前，用户第一眼看到的就是按告急程度排序的外设列表。
-    /// 小岛常驻仍然由 Priority（默认 45）决定，不跟硬件监控抢位置。
-    /// </summary>
-    public const int ExpandedPriority = 200;
-
     private readonly ISettingsStore _store;
 
     public PluginSettings(ISettingsStore store)

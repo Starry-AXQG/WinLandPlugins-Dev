@@ -113,7 +113,19 @@ internal sealed class ClassicBatteryIslandView : UserControl
             _morphTimer.Tick += (_, _) => OnMorphTick();
         }
 
-        Unloaded += (_, _) => _morphTimer?.Stop();
+        Loaded += (_, _) =>
+        {
+            if (Math.Abs(_progress - _morphTarget) > 0.001 && _morphTimer is { IsRunning: false })
+            {
+                _morphTimer.Start();
+            }
+        };
+        Unloaded += (_, _) =>
+        {
+            if (IsLoaded) return;
+            _morphTimer?.Stop();
+            ApplyMorph(_morphTarget, _morphTarget);
+        };
     }
 
     public double DesiredExpandedHeight =>

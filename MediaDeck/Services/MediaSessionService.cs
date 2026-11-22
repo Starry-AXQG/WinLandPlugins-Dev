@@ -79,6 +79,8 @@ public sealed class MediaSessionService : IDisposable
     private readonly ConcurrentDictionary<string, ResolvedAppInfo?> _appsFolderCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte[]?> _exeIconCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, FallbackClock> _fallbackClocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (string Title, string Artist, string Album, byte[]? Thumb)> _smtcLastGoodProps = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _smtcErrorLogThrottle = new(StringComparer.OrdinalIgnoreCase);
 
     // 稳定的有序实例表与播放状态记忆
     private readonly List<string> _orderedKeys = [];
@@ -194,42 +196,7 @@ public sealed class MediaSessionService : IDisposable
             var smtcCoveredHints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var dupCounter = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-            // 0) PotPlayer 原生多实例 Win32 IPC 通道（彻底绕过 PotPlayer 多开时的 SMTC 冲突、空标题与封面串台）
-            bool hasNativePotPlayer = false;
-            try
-            {
-                var potInstances = await _potPlayer.GetActiveInstancesAsync().ConfigureAwait(false);
-                foreach (var p in potInstances)
-                {
-                    hasNativePotPlayer = true;
-                    string potId = $"potplayer:{p.Hwnd.ToInt64():X}";
-                    snapshotMap[potId] = new MediaInstanceInfo
-                    {
-                        Id = potId,
-                        SourceAppId = "PotPlayerMini64.exe",
-                        SourceDisplayName = "PotPlayer",
-                        ProcessId = p.ProcessId,
-                        ExePath = p.ExePath,
-                        PotPlayerHwnd = p.Hwnd,
-                        LocalFilePath = p.FullFilePath,
-                        Title = p.Title,
-                        Artist = p.Artist,
-                        Album = p.Album,
-                        IsPlaying = p.IsPlaying,
-                        Position = p.Position,
-                        Duration = p.Duration,
-                        TimelineUpdatedAt = DateTimeOffset.UtcNow,
-                        ThumbnailBytes = p.ThumbnailBytes,
-                        AppIconBytes = p.AppIconBytes,
-                    };
-                    smtcCoveredHints.Add("PotPlayer");
-                    smtcCoveredHints.Add("PotPlayerMini64");
-                    smtcCoveredHints.Add("PotPlayerMini");
-                }
-            }
-            catch { }
-
-            // 1) 主通道：枚举全部 SMTC 会话（不因暂停或暂缺标题而丢弃 Spotify 等有效会话）
+            // 1) 主通道：优先在原始调度上下文中枚举全部 SMTC 会话（确保 Edge/Chrome/Firefox/Zen 的 TryGetMediaPropertiesAsync 稳定返回标题与封面）
             if (_manager is not null)
             {
                 var sessions = _manager.GetSessions();
@@ -239,16 +206,11 @@ public sealed class MediaSessionService : IDisposable
                     try
                     {
                         var appId = s.SourceAppUserModelId ?? $"unknown-{i}";
-                        // 若原生 PotPlayer IPC 通道已接管，跳过系统 SMTC 中易冲突的 PotPlayer 会话
-                        if (hasNativePotPlayer && appId.Contains("PotPlayer", StringComparison.OrdinalIgnoreCase))
-                        {
-                            continue;
-                        }
                         dupCounter.TryGetValue(appId, out int count);
                         dupCounter[appId] = count + 1;
                         string stableId = count == 0 ? $"smtc:{appId}" : $"smtc:{appId}#{count}";
 
-                        var info = await BuildSmtcInfoAsync(s, stableId, appId).ConfigureAwait(false);
+                        var info = await BuildSmtcInfoAsync(s, stableId, appId);
                         if (info is null) continue;
 
                         snapshotMap[info.Id] = info;
@@ -264,6 +226,48 @@ public sealed class MediaSessionService : IDisposable
                     }
                 }
             }
+
+            // 1.5) PotPlayer 原生多实例 Win32 IPC 通道（置于 SMTC 之后执行，不影响浏览器 SMTC 上下文；接管后替换易冲突的 PotPlayer SMTC 会话）
+            try
+            {
+                var potInstances = await _potPlayer.GetActiveInstancesAsync().ConfigureAwait(false);
+                if (potInstances.Count > 0)
+                {
+                    var potSmtcKeys = snapshotMap
+                        .Where(kv => kv.Value.SourceAppId.Contains("PotPlayer", StringComparison.OrdinalIgnoreCase))
+                        .Select(kv => kv.Key)
+                        .ToList();
+                    foreach (var pk in potSmtcKeys) snapshotMap.Remove(pk);
+
+                    foreach (var p in potInstances)
+                    {
+                        string potId = $"potplayer:{p.Hwnd.ToInt64():X}";
+                        snapshotMap[potId] = new MediaInstanceInfo
+                        {
+                            Id = potId,
+                            SourceAppId = "PotPlayerMini64.exe",
+                            SourceDisplayName = "PotPlayer",
+                            ProcessId = p.ProcessId,
+                            ExePath = p.ExePath,
+                            PotPlayerHwnd = p.Hwnd,
+                            LocalFilePath = p.FullFilePath,
+                            Title = p.Title,
+                            Artist = p.Artist,
+                            Album = p.Album,
+                            IsPlaying = p.IsPlaying,
+                            Position = p.Position,
+                            Duration = p.Duration,
+                            TimelineUpdatedAt = DateTimeOffset.UtcNow,
+                            ThumbnailBytes = p.ThumbnailBytes,
+                            AppIconBytes = p.AppIconBytes,
+                        };
+                    }
+                    smtcCoveredHints.Add("PotPlayer");
+                    smtcCoveredHints.Add("PotPlayerMini64");
+                    smtcCoveredHints.Add("PotPlayerMini");
+                }
+            }
+            catch { }
 
             // 2) 兜底通道：未接入 SMTC 的网易云等播放器（先触发一次后台合成器刷新，保证即使聚光卡未打开也能拿到实时发声态）
             if (EnableFallbackPlayers)
@@ -606,11 +610,28 @@ public sealed class MediaSessionService : IDisposable
         string appId)
     {
         GlobalSystemMediaTransportControlsSessionMediaProperties? props = null;
-        try
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            props = await session.TryGetMediaPropertiesAsync();
+            try
+            {
+                props = await session.TryGetMediaPropertiesAsync();
+                if (props is not null && !string.IsNullOrWhiteSpace(props.Title))
+                    break;
+            }
+            catch (Exception ex)
+            {
+                if (attempt == 1)
+                {
+                    var now = DateTimeOffset.UtcNow;
+                    if (!_smtcErrorLogThrottle.TryGetValue(appId, out var lastLog) || (now - lastLog).TotalSeconds > 30)
+                    {
+                        _smtcErrorLogThrottle[appId] = now;
+                        _log($"SMTC TryGetMediaPropertiesAsync 失败 ({appId})：{ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message}");
+                    }
+                }
+            }
+            if (attempt == 0) await Task.Delay(40);
         }
-        catch { }
 
         var playback = session.GetPlaybackInfo();
         var timeline = session.GetTimelineProperties();
@@ -624,6 +645,7 @@ public sealed class MediaSessionService : IDisposable
         if (status == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Closed &&
             string.IsNullOrWhiteSpace(title))
         {
+            _smtcLastGoodProps.TryRemove(stableId, out _);
             return null;
         }
 
@@ -644,6 +666,19 @@ public sealed class MediaSessionService : IDisposable
                 }
             }
             catch { }
+        }
+
+        // 浏览器 SMTC 偶发瞬态 RPC 失败时保留上一次成功读取的标题/歌手/封面，防止退化为裸浏览器名
+        if (!string.IsNullOrWhiteSpace(title))
+        {
+            _smtcLastGoodProps[stableId] = (title, artist, album, thumbBytes);
+        }
+        else if (_smtcLastGoodProps.TryGetValue(stableId, out var cachedProps))
+        {
+            title = cachedProps.Title;
+            artist = cachedProps.Artist;
+            album = cachedProps.Album;
+            thumbBytes ??= cachedProps.Thumb;
         }
 
         var hint = PolicyConfigInterop.CleanProcessHint(appId);

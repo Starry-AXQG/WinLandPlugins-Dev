@@ -39,8 +39,8 @@ public sealed partial class LyricsService : IDisposable
     public bool TryGetCachedLines(string title, string artist, out List<LyricLine>? lines)
         => _cache.TryGetValue(BuildCacheKey(title, artist), out lines);
 
-    /// <summary>后台拉取歌词并在完成后回调 onLoaded。</summary>
-    public void EnsureLyricsAsync(string title, string artist, TimeSpan duration, Action onLoaded)
+    /// <summary>后台拉取歌词并在完成后回调 onLoaded（支持直接传入网易云精准 songId）。</summary>
+    public void EnsureLyricsAsync(string title, string artist, TimeSpan duration, Action onLoaded, string? neteaseSongId = null)
     {
         if (string.IsNullOrWhiteSpace(title)) return;
         var key = BuildCacheKey(title, artist);
@@ -51,7 +51,10 @@ public sealed partial class LyricsService : IDisposable
         {
             try
             {
-                var lrc = await FetchFromNetEaseAsync(title, artist).ConfigureAwait(false)
+                var lrc = (!string.IsNullOrWhiteSpace(neteaseSongId)
+                              ? await FetchFromNetEaseByIdAsync(neteaseSongId).ConfigureAwait(false)
+                              : null)
+                          ?? await FetchFromNetEaseAsync(title, artist).ConfigureAwait(false)
                           ?? await FetchFromLrclibAsync(title, artist, duration).ConfigureAwait(false);
 
                 var parsed = string.IsNullOrWhiteSpace(lrc) ? [] : ParseLrc(lrc);
@@ -68,6 +71,37 @@ public sealed partial class LyricsService : IDisposable
                 _inFlight.TryRemove(key, out _);
             }
         });
+    }
+
+    private async Task<string?> FetchFromNetEaseByIdAsync(string songId)
+    {
+        try
+        {
+            var lyricUrl = $"https://music.163.com/api/song/lyric?id={Uri.EscapeDataString(songId)}&lv=1&kv=1&tv=-1";
+            using var lrcReq = new HttpRequestMessage(HttpMethod.Get, lyricUrl);
+            lrcReq.Headers.Referrer = new Uri("https://music.163.com/");
+
+            using var lrcResp = await _http.SendAsync(lrcReq).ConfigureAwait(false);
+            if (!lrcResp.IsSuccessStatusCode) return null;
+
+            var lrcJson = await lrcResp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            using var lrcDoc = JsonDocument.Parse(lrcJson);
+            if (lrcDoc.RootElement.TryGetProperty("lrc", out var lrcObj) &&
+                lrcObj.TryGetProperty("lyric", out var lyricProp) &&
+                lyricProp.ValueKind == JsonValueKind.String)
+            {
+                var lrcText = lyricProp.GetString();
+                if (!string.IsNullOrWhiteSpace(lrcText) && LrcTimestampRegex().IsMatch(lrcText))
+                {
+                    return lrcText;
+                }
+            }
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     public LyricTriplet GetTriplet(string title, string artist, TimeSpan position)

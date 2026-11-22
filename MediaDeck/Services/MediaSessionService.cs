@@ -16,6 +16,7 @@ public sealed record MediaInstanceInfo
     public string Title { get; init; } = "";
     public string Artist { get; init; } = "";
     public string Album { get; init; } = "";
+    public string? NetEaseSongId { get; init; }
     public bool IsPlaying { get; init; }
     public TimeSpan Position { get; init; }
     public TimeSpan Duration { get; init; }
@@ -67,6 +68,7 @@ public sealed class MediaSessionService : IDisposable
 
     private readonly AudioDeviceService _audioService;
     private readonly LyricsService _lyricsService;
+    private readonly NetEaseElogService _netEaseElog;
     private readonly Action<string> _log;
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly ConcurrentDictionary<string, ResolvedAppInfo?> _appsFolderCache = new(StringComparer.OrdinalIgnoreCase);
@@ -88,6 +90,8 @@ public sealed class MediaSessionService : IDisposable
     public event Action? SessionsUpdated;
 
     public IReadOnlyList<MediaInstanceInfo> Instances => _instances;
+
+    public bool HasAnyPlaying => _instances.Any(x => x.IsPlaying);
 
     public int SelectedIndex
     {
@@ -119,6 +123,7 @@ public sealed class MediaSessionService : IDisposable
     {
         _audioService = audioService;
         _lyricsService = lyricsService;
+        _netEaseElog = new NetEaseElogService(log);
         _log = log;
     }
 
@@ -200,11 +205,12 @@ public sealed class MediaSessionService : IDisposable
                 }
             }
 
-            // 2) 兜底通道：未接入 SMTC 的网易云等播放器
+            // 2) 兜底通道：未接入 SMTC 的网易云等播放器（先触发一次后台合成器刷新，保证即使聚光卡未打开也能拿到实时发声态）
             if (EnableFallbackPlayers)
             {
                 try
                 {
+                    _audioService.RequestRefreshMixer();
                     var mixerSessions = _audioService.GetVolumeMixerSessions();
                     foreach (var ms in mixerSessions)
                     {
@@ -320,11 +326,16 @@ public sealed class MediaSessionService : IDisposable
             catch { }
         }
 
-        // 兜底实例（如网易云）：只向该播放器窗口定向发送 WM_APPCOMMAND，绝不发送全局媒体键误触 QQ 音乐
-        if (cur.IsFallback && cur.ProcessId > 0)
+        // 兜底实例（如网易云）：避免发送未处理的 WM_APPCOMMAND 被 DefWindowProc 转发给系统 SMTC 唤醒 QQ 音乐
+        if (cur.IsFallback)
         {
-            PolicyConfigInterop.SendAppCommandToProcess(cur.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
-            await Task.Delay(200).ConfigureAwait(false);
+            if (cur.SourceAppId.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
+            {
+                _netEaseElog.NotifyOptimisticTogglePlayPause();
+            }
+            PolicyConfigInterop.ControlFallbackPlayer(cur.SourceAppId, cur.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
+            await RefreshAsync().ConfigureAwait(false);
+            await Task.Delay(260).ConfigureAwait(false);
             await RefreshAsync().ConfigureAwait(false);
         }
     }
@@ -346,9 +357,9 @@ public sealed class MediaSessionService : IDisposable
             catch { }
         }
 
-        if (cur.IsFallback && cur.ProcessId > 0)
+        if (cur.IsFallback)
         {
-            PolicyConfigInterop.SendAppCommandToProcess(cur.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_NEXTTRACK);
+            PolicyConfigInterop.ControlFallbackPlayer(cur.SourceAppId, cur.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_NEXTTRACK);
             await Task.Delay(250).ConfigureAwait(false);
             await RefreshAsync().ConfigureAwait(false);
         }
@@ -371,18 +382,19 @@ public sealed class MediaSessionService : IDisposable
             catch { }
         }
 
-        if (cur.IsFallback && cur.ProcessId > 0)
+        if (cur.IsFallback)
         {
-            PolicyConfigInterop.SendAppCommandToProcess(cur.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PREVIOUSTRACK);
+            PolicyConfigInterop.ControlFallbackPlayer(cur.SourceAppId, cur.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PREVIOUSTRACK);
             await Task.Delay(250).ConfigureAwait(false);
             await RefreshAsync().ConfigureAwait(false);
         }
     }
 
-    public async Task SeekAsync(TimeSpan target)
+    /// <summary>跳转进度。返回 true 表示播放器原生支持 Seek；返回 false 表示仅校准了本地歌词进度（如网易云兜底）。</summary>
+    public async Task<bool> SeekAsync(TimeSpan target)
     {
         var cur = CurrentInstance;
-        if (cur is null || cur.Duration <= TimeSpan.Zero) return;
+        if (cur is null || cur.Duration <= TimeSpan.Zero) return true;
 
         var clamped = TimeSpan.FromTicks(Math.Clamp(target.Ticks, 0, cur.Duration.Ticks));
         if (cur.SmtcSession is not null)
@@ -392,46 +404,80 @@ public sealed class MediaSessionService : IDisposable
                 await cur.SmtcSession.TryChangePlaybackPositionAsync(clamped.Ticks);
                 await Task.Delay(100).ConfigureAwait(false);
                 await RefreshAsync().ConfigureAwait(false);
+                return true;
             }
-            catch { }
+            catch { return true; }
         }
-        else if (cur.IsFallback && _fallbackClocks.TryGetValue(cur.Id, out var clock))
+
+        if (cur.IsFallback)
         {
-            // 兜底播放器不支持外部 Seek 时，至少允许手动校准歌词进度
-            clock.Accumulated = clamped;
-            clock.LastUpdated = DateTimeOffset.UtcNow;
+            if (cur.SourceAppId.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
+            {
+                _netEaseElog.CalibratePosition(clamped);
+            }
+            if (_fallbackClocks.TryGetValue(cur.Id, out var clock))
+            {
+                clock.Accumulated = clamped;
+                clock.LastUpdated = DateTimeOffset.UtcNow;
+            }
             await RefreshAsync().ConfigureAwait(false);
+            return false;
         }
+        return true;
     }
 
-    public async Task PauseAllAsync()
+    /// <summary>
+    /// 定时暂停到期执行：
+    ///   - 若当前有任何实例正在播放，则暂停所有正在播放的实例，并返回 true；
+    ///   - 若当前没有任何媒体正在播放，则按用户预期将行为替换为触发播放，并返回 false。
+    /// </summary>
+    public async Task<bool> ExecuteSleepTimerActionAsync()
     {
-        bool pausedAnySmtc = false;
-        foreach (var inst in _instances)
+        var playingList = _instances.Where(x => x.IsPlaying).ToList();
+        if (playingList.Count > 0)
         {
-            if (inst.IsPlaying && inst.SmtcSession is not null)
+            foreach (var inst in playingList)
             {
-                try
+                if (inst.SmtcSession is not null)
                 {
-                    await inst.SmtcSession.TryPauseAsync();
-                    pausedAnySmtc = true;
+                    try { await inst.SmtcSession.TryPauseAsync(); } catch { }
                 }
-                catch { }
+                else if (inst.IsFallback)
+                {
+                    if (inst.SourceAppId.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _netEaseElog.NotifyOptimisticTogglePlayPause();
+                    }
+                    PolicyConfigInterop.ControlFallbackPlayer(inst.SourceAppId, inst.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
+                }
             }
-            else if (inst.IsPlaying && inst.IsFallback && inst.ProcessId > 0)
-            {
-                PolicyConfigInterop.SendAppCommandToProcess(inst.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
-                pausedAnySmtc = true;
-            }
+            await Task.Delay(180).ConfigureAwait(false);
+            await RefreshAsync().ConfigureAwait(false);
+            return true;
         }
 
-        if (!pausedAnySmtc)
+        // 当前没有任何媒体在播放：触发当前选中实例（或系统媒体键）开始播放
+        var cur = CurrentInstance;
+        if (cur?.SmtcSession is not null)
+        {
+            try { await cur.SmtcSession.TryPlayAsync(); } catch { }
+        }
+        else if (cur is not null && cur.IsFallback)
+        {
+            if (cur.SourceAppId.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
+            {
+                _netEaseElog.NotifyOptimisticTogglePlayPause();
+            }
+            PolicyConfigInterop.ControlFallbackPlayer(cur.SourceAppId, cur.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
+        }
+        else
         {
             PolicyConfigInterop.SendMediaKey(PolicyConfigInterop.VK_MEDIA_PLAY_PAUSE);
         }
 
-        await Task.Delay(150).ConfigureAwait(false);
+        await Task.Delay(180).ConfigureAwait(false);
         await RefreshAsync().ConfigureAwait(false);
+        return false;
     }
 
     public bool ActivateCurrentSourceWindow()
@@ -524,8 +570,47 @@ public sealed class MediaSessionService : IDisposable
 
     private async Task<MediaInstanceInfo?> BuildFallbackInfoAsync(MixerSessionInfo ms)
     {
-        IntPtr hwnd = PolicyConfigInterop.FindMainWindowForPid((uint)ms.ProcessId);
+        IntPtr hwnd = PolicyConfigInterop.FindMainWindowForProcessGroup(ms.ProcessId, ms.ProcessName);
         string rawTitle = hwnd != IntPtr.Zero ? PolicyConfigInterop.GetWindowTitle(hwnd) : "";
+
+        string? exePath = null;
+        try
+        {
+            using var proc = Process.GetProcessById(ms.ProcessId);
+            exePath = proc.MainModule?.FileName;
+        }
+        catch { }
+
+        var iconBytes = ms.AppIconBytes ?? await GetOrLoadExeIconAsync(ms.ProcessName, exePath).ConfigureAwait(false);
+        string id = $"fallback:{ms.ProcessName}";
+
+        // 1) 网易云音乐专属 elog + playingList 深度解析（支持精准播放/暂停状态、真实封面、真实时长与 Seek 同步）
+        if (ms.ProcessName.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
+        {
+            var elogSnap = _netEaseElog.PollSnapshot(ms.IsGeneratingSound, rawTitle);
+            if (elogSnap is not null)
+            {
+                return new MediaInstanceInfo
+                {
+                    Id = id,
+                    SourceAppId = ms.ProcessName,
+                    SourceDisplayName = ms.DisplayName,
+                    ProcessId = ms.ProcessId,
+                    IsFallback = true,
+                    NetEaseSongId = elogSnap.SongId,
+                    Title = elogSnap.Title,
+                    Artist = elogSnap.Artist,
+                    Album = elogSnap.Album,
+                    IsPlaying = elogSnap.IsPlaying,
+                    Position = elogSnap.Position,
+                    Duration = elogSnap.Duration,
+                    TimelineUpdatedAt = elogSnap.UpdatedAt,
+                    ThumbnailBytes = elogSnap.CoverBytes,
+                    AppIconBytes = iconBytes,
+                };
+            }
+        }
+
         if (string.IsNullOrWhiteSpace(rawTitle)) return null;
 
         string title = rawTitle;
@@ -537,9 +622,9 @@ public sealed class MediaSessionService : IDisposable
             artist = parts[1].Trim();
         }
 
-        string id = $"fallback:{ms.ProcessName}:{ms.ProcessId}";
         string trackKey = $"{title}||{artist}";
         var now = DateTimeOffset.UtcNow;
+        bool isPlayingNow = ms.IsGeneratingSound || ms.IsActive;
 
         var clock = _fallbackClocks.GetOrAdd(id, _ => new FallbackClock { TrackKey = trackKey, LastUpdated = now });
         if (!string.Equals(clock.TrackKey, trackKey, StringComparison.OrdinalIgnoreCase))
@@ -561,7 +646,7 @@ public sealed class MediaSessionService : IDisposable
         {
             clock.LastUpdated = now;
         }
-        clock.WasPlaying = ms.IsActive;
+        clock.WasPlaying = isPlayingNow;
 
         TimeSpan duration = TimeSpan.Zero;
         if (_lyricsService.TryGetCachedDuration(title, artist, out var cachedDur))
@@ -569,16 +654,6 @@ public sealed class MediaSessionService : IDisposable
             duration = cachedDur;
             if (clock.Accumulated > duration) clock.Accumulated = duration;
         }
-
-        string? exePath = null;
-        try
-        {
-            using var proc = Process.GetProcessById(ms.ProcessId);
-            exePath = proc.MainModule?.FileName;
-        }
-        catch { }
-
-        var iconBytes = await GetOrLoadExeIconAsync(ms.ProcessName, exePath).ConfigureAwait(false);
 
         return new MediaInstanceInfo
         {
@@ -589,7 +664,7 @@ public sealed class MediaSessionService : IDisposable
             IsFallback = true,
             Title = title,
             Artist = artist,
-            IsPlaying = ms.IsActive,
+            IsPlaying = isPlayingNow,
             Position = clock.Accumulated,
             Duration = duration,
             TimelineUpdatedAt = now,
@@ -668,6 +743,7 @@ public sealed class MediaSessionService : IDisposable
     public void Dispose()
     {
         _disposed = true;
+        _netEaseElog.Dispose();
         _refreshGate.Dispose();
     }
 }

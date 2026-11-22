@@ -47,11 +47,14 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         Context.Register(_mediaService);
         Context.Register(_lyricsService);
 
-        _view = new MediaDeckView(Theme, _audioService.GetCurrentAudioPeak);
-        _view.SetAuroraEnabled(Settings.Get("aurora_enabled", true));
+        _view = new MediaDeckView(
+            Theme,
+            _audioService.GetCurrentAudioPeak,
+            () => (_audioService.MasterVolumePercent, _audioService.MasterMuted));
+        ApplyVisualEffectSetting();
 
         // 启动时预先构造聚光卡视图树，首次点击秒开
-        _spotlightView = new MediaDeckSpotlightView(Theme, _audioService, _sleepTimer);
+        _spotlightView = CreateSpotlightView();
 
         // 绑定大岛卡片交互
         _view.ActivateSourceRequested += () =>
@@ -70,18 +73,33 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         _view.PlayPauseRequested += () => _ = _mediaService.TogglePlayPauseAsync();
         _view.PreviousRequested += () => _ = _mediaService.PreviousAsync();
         _view.NextRequested += () => _ = _mediaService.NextAsync();
-        _view.SeekRatioRequested += ratio =>
+        _view.SeekRatioRequested += async ratio =>
         {
             var cur = _mediaService.CurrentInstance;
             if (cur is not null && cur.Duration > TimeSpan.Zero)
             {
                 var target = TimeSpan.FromSeconds(cur.Duration.TotalSeconds * ratio);
-                _ = _mediaService.SeekAsync(target);
+                bool nativeSeeked = await _mediaService.SeekAsync(target);
+                if (!nativeSeeked && !_stopped)
+                {
+                    RunOnUI(() =>
+                    {
+                        Context.Island.ShowMessage(new IslandMessage
+                        {
+                            Title = "已校准歌词进度",
+                            Text = $"{cur.SourceDisplayName} 客户端未开放外部跳转接口，已为您校准本地歌词时间",
+                            Glyph = "\uE8D6",
+                            Duration = TimeSpan.FromSeconds(2.5),
+                        });
+                    });
+                }
             }
         };
         _view.SwitchInstanceRequested += delta => _mediaService.SwitchInstance(delta);
         _view.SelectInstanceRequested += idx => _mediaService.SelectInstance(idx);
         _view.SwitchOutputDeviceRequested += deviceId => _audioService.SwitchOutputDeviceAsync(deviceId);
+        _view.MasterVolumeChangedRequested += pct => _audioService.SetMasterVolume(pct);
+        _view.MasterVolumeStepRequested += delta => _audioService.StepMasterVolume(delta);
 
         // 服务事件监听
         _mediaService.SessionsUpdated += () =>
@@ -131,19 +149,20 @@ public sealed class MediaDeckPlugin : IslandPluginBase
             RunOnUI(() => _view.UpdateSleepTimer(_sleepTimer.IsActive, _sleepTimer.Remaining));
         };
 
-        _sleepTimer.Expired += () =>
+        _sleepTimer.Expired += async () =>
         {
             if (_stopped) return;
-            _ = _mediaService.PauseAllAsync();
+            bool pausedAny = await _mediaService.ExecuteSleepTimerActionAsync();
+            if (_stopped) return;
             RunOnUI(() =>
             {
                 Context.Island.ShowMessage(new IslandMessage
                 {
-                    Title = "定时暂停已触发",
-                    Text = "已自动暂停当前媒体播放",
+                    Title = pausedAny ? "定时暂停已触发" : "定时操作已触发",
+                    Text = pausedAny ? "已自动暂停当前媒体播放" : "倒计时结束时无正在播放的媒体，已按设定替换为触发播放",
                     Glyph = "\uE916",
                     AccentColor = Color.FromArgb(255, 56, 189, 248),
-                    Duration = TimeSpan.FromSeconds(3),
+                    Duration = TimeSpan.FromSeconds(3.5),
                 });
             });
         };
@@ -162,9 +181,9 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         {
             SetContent(Settings.Get("enabled", true) ? _content : null);
         }));
-        Context.Register(Context.OnSettingsChanged("aurora_enabled", () =>
+        Context.Register(Context.OnSettingsChanged("visual_effect_mode", () =>
         {
-            RunOnUI(() => _view.SetAuroraEnabled(Settings.Get("aurora_enabled", true)));
+            RunOnUI(ApplyVisualEffectSetting);
         }));
         Context.Register(Context.OnSettingsChanged("fallback_players", () =>
         {
@@ -221,7 +240,7 @@ public sealed class MediaDeckPlugin : IslandPluginBase
             EvaluateDynamicPriority();
         }
 
-        if (_tickCount % 6 == 0)
+        if (_tickCount % 3 == 0)
         {
             _ = _mediaService.RefreshAsync();
         }
@@ -311,11 +330,23 @@ public sealed class MediaDeckPlugin : IslandPluginBase
             _lyricsService.EnsureLyricsAsync(current.Title, current.Artist, current.Duration, () =>
             {
                 if (!_stopped) RunOnUI(RenderMediaSnapshot);
-            });
+            }, current.NetEaseSongId);
             triplet = _lyricsService.GetTriplet(current.Title, current.Artist, current.EstimatedPosition);
         }
 
         _view.UpdateMedia(current, _mediaService.Instances.Count, _mediaService.SelectedIndex, triplet);
+    }
+
+    private void ApplyVisualEffectSetting()
+    {
+        int raw = Settings.Get("visual_effect_mode", 0);
+        var mode = raw switch
+        {
+            1 => VisualEffectMode.AlbumContour,
+            2 => VisualEffectMode.Off,
+            _ => VisualEffectMode.AuroraWave,
+        };
+        _view.SetVisualEffectMode(mode);
     }
 
     private void RefreshDevicesOnUI()
@@ -324,11 +355,29 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         _view.UpdateOutputDevices(_audioService.CachedOutputDevices);
     }
 
+    private MediaDeckSpotlightView CreateSpotlightView() => new(
+        Theme,
+        _audioService,
+        _sleepTimer,
+        () => _mediaService.HasAnyPlaying,
+        warningText =>
+        {
+            if (_stopped) return;
+            Context.Island.ShowMessage(new IslandMessage
+            {
+                Title = "定时暂停提示",
+                Text = warningText,
+                Glyph = "\uE916",
+                AccentColor = Color.FromArgb(255, 245, 158, 11),
+                Duration = TimeSpan.FromSeconds(4),
+            });
+        });
+
     private void OpenSpotlight()
     {
         try
         {
-            _spotlightView ??= new MediaDeckSpotlightView(Theme, _audioService, _sleepTimer);
+            _spotlightView ??= CreateSpotlightView();
             Context.Island.OpenSpotlight(new IslandSpotlight
             {
                 Content = _spotlightView,
@@ -352,7 +401,36 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         });
 
         panel.Children.Add(MakeToggleCard("在灵动岛上显示", "enabled", true));
-        panel.Children.Add(MakeToggleCard("音频响应背景流光（胶囊与卡片形态）", "aurora_enabled", true));
+
+        // 视觉特效模式选择（极光流光波浪 vs 专辑封面物理轮廓光 vs 关闭）
+        bool loadingVisual = true;
+        var visualCombo = new ComboBox
+        {
+            Header = "胶囊与卡片音频视觉效果",
+            MinWidth = 340,
+            Items =
+            {
+                "流光极光波浪（随音频频率起伏流动）",
+                "专辑封面物理轮廓光（取封面多色合成渐变，底部最亮自下而上衰减）",
+                "关闭背景视觉效果",
+            },
+            SelectedIndex = Math.Clamp(Settings.Get("visual_effect_mode", 0), 0, 2),
+        };
+        visualCombo.SelectionChanged += (_, _) =>
+        {
+            if (loadingVisual || visualCombo.SelectedIndex < 0) return;
+            if (visualCombo.SelectedIndex != Settings.Get("visual_effect_mode", 0))
+            {
+                Settings.Set("visual_effect_mode", visualCombo.SelectedIndex);
+            }
+        };
+        loadingVisual = false;
+        panel.Children.Add(new Border
+        {
+            Style = (Style)Application.Current.Resources["SettingsCardStyle"],
+            Child = visualCombo,
+        });
+
         panel.Children.Add(MakeToggleCard("蓝牙耳机接入提醒", "bt_notify", true));
         panel.Children.Add(MakeToggleCard("卡片上显示同步歌词", "lyrics_enabled", true));
         panel.Children.Add(MakeToggleCard("兼容未接入系统媒体控制的播放器（如网易云音乐）", "fallback_players", true));

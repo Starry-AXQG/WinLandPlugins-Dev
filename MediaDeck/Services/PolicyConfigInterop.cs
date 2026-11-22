@@ -55,15 +55,45 @@ internal static class PolicyConfigInterop
         [PreserveSig] int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, int bVisible);
     }
 
+    [ComImport]
+    [Guid("568b9108-44bf-40b4-9006-86afe5b5a620")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPolicyConfigVista
+    {
+        [PreserveSig] int GetMixFormat(string pszDeviceName, IntPtr ppFormat);
+        [PreserveSig] int GetDeviceFormat(string pszDeviceName, int bDefault, IntPtr ppFormat);
+        [PreserveSig] int SetDeviceFormat(string pszDeviceName, IntPtr pEndpointFormat, IntPtr mixFormat);
+        [PreserveSig] int GetProcessingPeriod(string pszDeviceName, int bDefault, IntPtr pmftDefaultPeriod, IntPtr pmftMinimumPeriod);
+        [PreserveSig] int SetProcessingPeriod(string pszDeviceName, IntPtr pmftPeriod);
+        [PreserveSig] int GetShareMode(string pszDeviceName, IntPtr pMode);
+        [PreserveSig] int SetShareMode(string pszDeviceName, IntPtr mode);
+        [PreserveSig] int GetPropertyValue(string pszDeviceName, IntPtr key, IntPtr pv);
+        [PreserveSig] int SetPropertyValue(string pszDeviceName, IntPtr key, IntPtr pv);
+        [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, ERole role);
+        [PreserveSig] int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, int bVisible);
+    }
+
     public static bool SetDefaultAudioEndpoint(string deviceId)
     {
         try
         {
-            var client = (IPolicyConfig)new PolicyConfigClientComObject();
-            int hr1 = client.SetDefaultEndpoint(deviceId, ERole.Console);
-            int hr2 = client.SetDefaultEndpoint(deviceId, ERole.Multimedia);
-            int hr3 = client.SetDefaultEndpoint(deviceId, ERole.Communications);
-            return hr1 == 0 || hr2 == 0 || hr3 == 0;
+            var comObj = new PolicyConfigClientComObject();
+            if (comObj is IPolicyConfig client)
+            {
+                // 优先切换 Multimedia 角色（系统枚举默认设备以此为准），再切 Console 与 Communications
+                int hr1 = client.SetDefaultEndpoint(deviceId, ERole.Multimedia);
+                int hr2 = client.SetDefaultEndpoint(deviceId, ERole.Console);
+                int hr3 = client.SetDefaultEndpoint(deviceId, ERole.Communications);
+                if (hr1 == 0 || hr2 == 0 || hr3 == 0) return true;
+            }
+            if (comObj is IPolicyConfigVista vista)
+            {
+                int hr1 = vista.SetDefaultEndpoint(deviceId, ERole.Multimedia);
+                int hr2 = vista.SetDefaultEndpoint(deviceId, ERole.Console);
+                int hr3 = vista.SetDefaultEndpoint(deviceId, ERole.Communications);
+                return hr1 == 0 || hr2 == 0 || hr3 == 0;
+            }
+            return false;
         }
         catch
         {
@@ -167,10 +197,15 @@ internal static class PolicyConfigInterop
         }
     }
 
-    // ---- 全局媒体按键 & 定向窗口媒体命令 ----
+    // ---- 全局媒体按键 & 定向播放器控制 ----
 
     private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const byte VK_CONTROL = 0x11;
+    private const byte VK_MENU = 0x12; // Alt
+    private const byte VK_LEFT = 0x25;
+    private const byte VK_RIGHT = 0x27;
+    private const byte VK_P = 0x50;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
@@ -178,27 +213,95 @@ internal static class PolicyConfigInterop
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
     public static void SendMediaKey(byte vk)
     {
         keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, UIntPtr.Zero);
         keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
     }
 
-    /// <summary>向指定进程主窗口定向投递 WM_APPCOMMAND（如播放/暂停、切歌），不误触其他 SMTC 播放器。</summary>
-    public static bool SendAppCommandToProcess(int processId, int appCommand)
+    public static void SendCtrlAltKey(byte vk, bool extended = false)
     {
+        uint extFlag = extended ? KEYEVENTF_EXTENDEDKEY : 0;
+        keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+        keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
+        keybd_event(vk, 0, extFlag, UIntPtr.Zero);
+        keybd_event(vk, 0, extFlag | KEYEVENTF_KEYUP, UIntPtr.Zero);
+        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
+
+    /// <summary>
+    /// 控制非 SMTC 兜底播放器：
+    ///   - 网易云音乐（cloudmusic）若收到未处理的 WM_APPCOMMAND，会由 DefWindowProc 转发给系统 Shell Hook (HSHELL_APPCOMMAND)，
+    ///     从而错误唤醒当前活跃的 SMTC 播放器（如 QQ 音乐）！
+    ///   - 因此对网易云直接触发其内置全局热键（Ctrl+Alt+P 播放/暂停，Ctrl+Alt+Left/Right 上/下一首），由系统 RegisterHotKey
+    ///     直接路由给网易云，绝不触发 QQ 音乐。
+    /// </summary>
+    public static bool ControlFallbackPlayer(string processName, int processId, int appCommand)
+    {
+        if (processName.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
+        {
+            switch (appCommand)
+            {
+                case APPCOMMAND_MEDIA_PLAY_PAUSE:
+                    SendCtrlAltKey(VK_P, extended: false);
+                    return true;
+                case APPCOMMAND_MEDIA_PREVIOUSTRACK:
+                    SendCtrlAltKey(VK_LEFT, extended: true);
+                    return true;
+                case APPCOMMAND_MEDIA_NEXTTRACK:
+                    SendCtrlAltKey(VK_RIGHT, extended: true);
+                    return true;
+            }
+        }
+
         if (processId <= 0) return false;
-        IntPtr hwnd = FindMainWindowForPid((uint)processId);
+        IntPtr hwnd = FindMainWindowForProcessGroup(processId, processName);
         if (hwnd == IntPtr.Zero) return false;
 
         IntPtr lParam = (IntPtr)(appCommand << 16);
         return PostMessage(hwnd, WM_APPCOMMAND, hwnd, lParam);
     }
 
-    // ---- 激活来源程序窗口 ----
+    // ---- 激活来源程序窗口 & 任务栏/窗口闪烁提醒 ----
 
     private const int SW_RESTORE = 9;
     private const int SW_SHOW = 5;
+    private const uint FLASHW_ALL = 0x00000003;
+    private const uint FLASHW_TIMERNOFG = 0x0000000C;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FLASHWINFO
+    {
+        public uint cbSize;
+        public IntPtr hwnd;
+        public uint dwFlags;
+        public uint uCount;
+        public uint dwTimeout;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
+
+    private static IntPtr _lastActivatedHwnd = IntPtr.Zero;
+    private static DateTimeOffset _lastActivatedAt = DateTimeOffset.MinValue;
+
+    public static void FlashWindowAndTaskbar(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return;
+        var info = new FLASHWINFO
+        {
+            cbSize = (uint)Marshal.SizeOf<FLASHWINFO>(),
+            hwnd = hWnd,
+            dwFlags = FLASHW_ALL,
+            uCount = 3,
+            dwTimeout = 75,
+        };
+        FlashWindowEx(ref info);
+    }
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
@@ -219,6 +322,47 @@ internal static class PolicyConfigInterop
 
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, char[] lpClassName, int nMaxCount);
+
+    private const uint GW_OWNER = 4;
+
+    public static string GetWindowClassName(IntPtr hWnd)
+    {
+        var buf = new char[256];
+        int len = GetClassName(hWnd, buf, buf.Length);
+        return len > 0 ? new string(buf, 0, len) : string.Empty;
+    }
+
+    private static bool IsDummySystemWindow(IntPtr hWnd, string title, string className)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return true;
+        if (title.Equals("Default IME", StringComparison.OrdinalIgnoreCase) ||
+            title.Equals("MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
+            title.Equals("GDI+ Window", StringComparison.OrdinalIgnoreCase) ||
+            title.StartsWith("GDI+ Window", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (className.Equals("IME", StringComparison.OrdinalIgnoreCase) ||
+            className.Equals("MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
+            className.Equals("CiceroUIWndFrame", StringComparison.OrdinalIgnoreCase) ||
+            className.Equals("DummyDWMListenerWindow", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        return false;
+    }
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
@@ -247,32 +391,51 @@ internal static class PolicyConfigInterop
     public static bool ActivateWindowByProcessIdOrName(int processId, string? hintProcessName, string? displayName = null)
     {
         IntPtr targetHwnd = IntPtr.Zero;
+        IntPtr fallbackHiddenHwnd = IntPtr.Zero;
 
-        if (processId > 0)
+        // 1) 构建所有候选进程名列表（兼容 Zen/Firefox/Spotify/网易云/Edge 等多进程应用）
+        var candidates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(hintProcessName))
         {
-            targetHwnd = FindMainWindowForPid((uint)processId);
+            candidates.Add(CleanProcessHint(hintProcessName));
+        }
+        if (!string.IsNullOrWhiteSpace(displayName))
+        {
+            var low = displayName.Trim().ToLowerInvariant();
+            if (low.Contains("zen")) candidates.Add("zen");
+            if (low.Contains("firefox")) candidates.Add("firefox");
+            if (low.Contains("spotify")) candidates.Add("Spotify");
+            if (low.Contains("edge")) candidates.Add("msedge");
+            if (low.Contains("chrome")) candidates.Add("chrome");
+            if (low.Contains("qq")) candidates.Add("QQMusic");
+            if (low.Contains("网易")) candidates.Add("cloudmusic");
+            candidates.Add(displayName.Trim().Replace(" ", ""));
         }
 
+        // 2) 优先按已知主窗口类名精确定位（如网易云音乐 OrpheusBrowserHost）
+        if (candidates.Any(c => c.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase)))
+        {
+            IntPtr orpheus = FindWindow("OrpheusBrowserHost", null);
+            if (orpheus != IntPtr.Zero)
+            {
+                if (IsWindowVisible(orpheus)) targetHwnd = orpheus;
+                else fallbackHiddenHwnd = orpheus;
+            }
+        }
+
+        // 3) 先在指定 PID 上找可见主窗口（绝不把子进程的隐藏 Default IME 窗口当成主窗口）
+        if (targetHwnd == IntPtr.Zero && processId > 0)
+        {
+            targetHwnd = FindMainWindowForPid((uint)processId, visibleOnly: true);
+            if (fallbackHiddenHwnd == IntPtr.Zero)
+            {
+                fallbackHiddenHwnd = FindMainWindowForPid((uint)processId, visibleOnly: false);
+            }
+        }
+
+        // 4) 若指定 PID 是无界面的音频/渲染子进程，遍历同名所有进程寻找真正的可见主窗口
         if (targetHwnd == IntPtr.Zero)
         {
-            var candidates = new List<string>();
-            if (!string.IsNullOrWhiteSpace(hintProcessName))
-            {
-                candidates.Add(CleanProcessHint(hintProcessName));
-            }
-            if (!string.IsNullOrWhiteSpace(displayName))
-            {
-                var low = displayName.Trim().ToLowerInvariant();
-                if (low.Contains("zen")) candidates.Add("zen");
-                if (low.Contains("firefox")) candidates.Add("firefox");
-                if (low.Contains("spotify")) candidates.Add("Spotify");
-                if (low.Contains("edge")) candidates.Add("msedge");
-                if (low.Contains("chrome")) candidates.Add("chrome");
-                if (low.Contains("qq")) candidates.Add("QQMusic");
-                if (low.Contains("网易")) candidates.Add("cloudmusic");
-                candidates.Add(displayName.Trim().Replace(" ", ""));
-            }
-
             foreach (var name in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
             {
                 if (string.IsNullOrWhiteSpace(name)) continue;
@@ -280,13 +443,15 @@ internal static class PolicyConfigInterop
                 {
                     try
                     {
-                        var hwnd = proc.MainWindowHandle != IntPtr.Zero
-                            ? proc.MainWindowHandle
-                            : FindMainWindowForPid((uint)proc.Id);
-                        if (hwnd != IntPtr.Zero)
+                        var vis = FindMainWindowForPid((uint)proc.Id, visibleOnly: true);
+                        if (vis != IntPtr.Zero)
                         {
-                            targetHwnd = hwnd;
+                            targetHwnd = vis;
                             break;
+                        }
+                        if (fallbackHiddenHwnd == IntPtr.Zero)
+                        {
+                            fallbackHiddenHwnd = FindMainWindowForPid((uint)proc.Id, visibleOnly: false);
                         }
                     }
                     catch { }
@@ -296,11 +461,68 @@ internal static class PolicyConfigInterop
             }
         }
 
+        if (targetHwnd == IntPtr.Zero)
+        {
+            targetHwnd = fallbackHiddenHwnd;
+        }
         if (targetHwnd == IntPtr.Zero) return false;
-        return BringWindowToFront(targetHwnd);
+
+        IntPtr currentFg = GetForegroundWindow();
+        bool alreadyActive = !IsIconic(targetHwnd) && IsWindowVisible(targetHwnd) &&
+            (currentFg == targetHwnd ||
+             (targetHwnd == _lastActivatedHwnd && (DateTimeOffset.UtcNow - _lastActivatedAt).TotalSeconds < 6));
+
+        if (alreadyActive)
+        {
+            BringWindowToFront(targetHwnd);
+            FlashWindowAndTaskbar(targetHwnd);
+            _lastActivatedHwnd = targetHwnd;
+            _lastActivatedAt = DateTimeOffset.UtcNow;
+            return true;
+        }
+
+        bool ok = BringWindowToFront(targetHwnd);
+        _lastActivatedHwnd = targetHwnd;
+        _lastActivatedAt = DateTimeOffset.UtcNow;
+        return ok;
     }
 
-    public static IntPtr FindMainWindowForPid(uint pid)
+    /// <summary>针对多进程架构播放器（如网易云音乐音频子进程与 UI 主进程分离），按 PID + 进程名联合查找主窗口。</summary>
+    public static IntPtr FindMainWindowForProcessGroup(int pid, string? processName)
+    {
+        if (!string.IsNullOrWhiteSpace(processName) &&
+            processName.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
+        {
+            IntPtr orpheus = FindWindow("OrpheusBrowserHost", null);
+            if (orpheus != IntPtr.Zero) return orpheus;
+        }
+
+        if (pid > 0)
+        {
+            IntPtr byPid = FindMainWindowForPid((uint)pid);
+            if (byPid != IntPtr.Zero) return byPid;
+        }
+
+        if (!string.IsNullOrWhiteSpace(processName))
+        {
+            foreach (var p in Process.GetProcessesByName(CleanProcessHint(processName)))
+            {
+                try
+                {
+                    IntPtr h = p.MainWindowHandle != IntPtr.Zero
+                        ? p.MainWindowHandle
+                        : FindMainWindowForPid((uint)p.Id);
+                    if (h != IntPtr.Zero) return h;
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+        }
+
+        return IntPtr.Zero;
+    }
+
+    public static IntPtr FindMainWindowForPid(uint pid, bool visibleOnly = false)
     {
         IntPtr bestVisible = IntPtr.Zero;
         IntPtr bestHidden = IntPtr.Zero;
@@ -311,22 +533,29 @@ internal static class PolicyConfigInterop
             if (winPid != pid) return true;
 
             var title = GetWindowTitle(hWnd);
-            if (string.IsNullOrWhiteSpace(title)) return true;
+            var cls = GetWindowClassName(hWnd);
+            if (IsDummySystemWindow(hWnd, title, cls)) return true;
 
             if (IsWindowVisible(hWnd))
             {
-                bestVisible = hWnd;
-                return false;
+                // 优先无 Owner 的顶层主窗口
+                if (GetWindow(hWnd, GW_OWNER) == IntPtr.Zero)
+                {
+                    bestVisible = hWnd;
+                    return false;
+                }
+                if (bestVisible == IntPtr.Zero) bestVisible = hWnd;
+                return true;
             }
 
-            if (bestHidden == IntPtr.Zero)
+            if (!visibleOnly && bestHidden == IntPtr.Zero && GetWindow(hWnd, GW_OWNER) == IntPtr.Zero)
             {
                 bestHidden = hWnd;
             }
             return true;
         }, IntPtr.Zero);
 
-        return bestVisible != IntPtr.Zero ? bestVisible : bestHidden;
+        return bestVisible != IntPtr.Zero ? bestVisible : (visibleOnly ? IntPtr.Zero : bestHidden);
     }
 
     public static bool BringWindowToFront(IntPtr hWnd)
@@ -343,11 +572,18 @@ internal static class PolicyConfigInterop
         bool attached = false;
         try
         {
+            // 发送一次无副作用的 Alt 释放事件，解除 Windows 对非激活窗口 (WS_EX_NOACTIVATE) 进程的前台焦点锁定
+            keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
+
             if (fgThread != 0 && fgThread != curThread)
             {
                 attached = AttachThreadInput(curThread, fgThread, true);
             }
-            return SetForegroundWindow(hWnd);
+
+            BringWindowToTop(hWnd);
+            bool ok = SetForegroundWindow(hWnd);
+            SwitchToThisWindow(hWnd, true);
+            return ok || GetForegroundWindow() == hWnd;
         }
         finally
         {

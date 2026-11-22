@@ -11,6 +11,7 @@ public enum AudioOutputKind
 {
     Speaker,
     Headphone,
+    DisplayAudio,
 }
 
 public sealed record AudioDeviceInfo(
@@ -19,7 +20,15 @@ public sealed record AudioDeviceInfo(
     string ShortName,
     AudioOutputKind Kind,
     bool IsBluetooth,
-    bool IsDefault);
+    bool IsDefault)
+{
+    public string Glyph => Kind switch
+    {
+        AudioOutputKind.Headphone => "\uE7F6",
+        AudioOutputKind.DisplayAudio => "\uE7F4",
+        _ => "\uE7F5",
+    };
+}
 
 public sealed record MixerSessionInfo(
     string SessionKey,
@@ -28,7 +37,9 @@ public sealed record MixerSessionInfo(
     string ProcessName,
     float Volume,
     bool IsMuted,
-    bool IsActive);
+    bool IsActive,
+    bool IsGeneratingSound,
+    byte[]? AppIconBytes);
 
 public sealed record SpatialSoundOption(
     string Subtype,
@@ -58,6 +69,7 @@ public sealed class AudioDeviceService : IDisposable
     private readonly Thread _audioThread;
     private readonly Thread _meterThread;
     private readonly HashSet<string> _knownActiveDeviceIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte[]?> _mixerIconCache = new(StringComparer.OrdinalIgnoreCase);
 
     // 仅在 _audioThread 上访问的 COM 实例
     private MMDeviceEnumerator? _enumerator;
@@ -71,12 +83,20 @@ public sealed class AudioDeviceService : IDisposable
     private long _mixerVersion;
     private long _spatialVersion;
 
-    // 实时音频电平（后台电平线程写入，UI 线程无锁读取）
+    // 实时音频电平与系统主音量（后台电平线程写入，UI 线程无锁读取）
     private volatile float _peakMaster;
     private volatile float _peakLeft;
     private volatile float _peakRight;
+    private volatile int _masterVolumePercent = 50;
+    private volatile bool _masterMuted;
+    private long _masterVolLockUntilTicks;
     private volatile bool _resetMeterFlag;
+    private volatile string? _lockedTargetDeviceId;
+    private long _lockedTargetUntilTicks;
     private volatile bool _disposed;
+
+    public int MasterVolumePercent => _masterVolumePercent;
+    public bool MasterMuted => _masterMuted;
 
     public IReadOnlyList<AudioDeviceInfo> CachedOutputDevices => _cachedDevices;
     public IReadOnlyList<MixerSessionInfo> CachedMixerSessions => _cachedMixer;
@@ -117,6 +137,35 @@ public sealed class AudioDeviceService : IDisposable
     public (float Master, float Left, float Right) GetCurrentAudioPeak()
         => (_peakMaster, _peakLeft, _peakRight);
 
+    /// <summary>调整系统主音量（0..100），乐观更新 UI，后台异步写入 CoreAudio。</summary>
+    public int SetMasterVolume(int percent)
+    {
+        int clamped = Math.Clamp(percent, 0, 100);
+        _masterVolumePercent = clamped;
+        if (clamped > 0) _masterMuted = false;
+        Interlocked.Exchange(ref _masterVolLockUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(600).UtcTicks);
+
+        EnqueueWork(() =>
+        {
+            if (_enumerator is null) return;
+            try
+            {
+                using var def = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                def.AudioEndpointVolume.MasterVolumeLevelScalar = clamped / 100f;
+                if (clamped > 0 && def.AudioEndpointVolume.Mute)
+                {
+                    def.AudioEndpointVolume.Mute = false;
+                }
+            }
+            catch { }
+        });
+        return clamped;
+    }
+
+    /// <summary>按步进（如 ±2）调整系统主音量。</summary>
+    public int StepMasterVolume(int deltaPercent)
+        => SetMasterVolume(_masterVolumePercent + deltaPercent);
+
     /// <summary>向后台音频线程投递全量缓存刷新（立即返回，不阻塞调用方）。</summary>
     public void RequestRefreshAll()
     {
@@ -131,10 +180,17 @@ public sealed class AudioDeviceService : IDisposable
         EnqueueWork(RefreshMixerOnWorker);
     }
 
-    /// <summary>异步切换默认音频输出设备：立即乐观更新快照，COM 切换完全在后台音频线程执行。</summary>
+    /// <summary>
+    /// 异步切换默认音频输出设备：
+    ///   - 立即乐观更新快照并设置 1.5s 目标设备锁（防止切换 3 个 Role 期间系统中间态通知把 UI 刷回原设备）；
+    ///   - 独立高优先级线程直接调用 IPolicyConfig，不排在音量合成器枚举队列后面，消除切换延迟。
+    /// </summary>
     public void SwitchOutputDeviceAsync(string deviceId)
     {
         if (_disposed || string.IsNullOrWhiteSpace(deviceId)) return;
+
+        _lockedTargetDeviceId = deviceId;
+        Interlocked.Exchange(ref _lockedTargetUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(1500).UtcTicks);
 
         // 乐观更新，UI 零等待
         _cachedDevices = _cachedDevices
@@ -143,13 +199,21 @@ public sealed class AudioDeviceService : IDisposable
         Interlocked.Increment(ref _devicesVersion);
         DevicesChanged?.Invoke();
 
-        EnqueueWork(() =>
+        _ = Task.Run(() =>
         {
-            PolicyConfigInterop.SetDefaultAudioEndpoint(deviceId);
+            bool ok = PolicyConfigInterop.SetDefaultAudioEndpoint(deviceId);
+            if (!ok)
+            {
+                // 失败则立刻解除锁并回刷真实设备状态
+                _lockedTargetDeviceId = null;
+                Interlocked.Exchange(ref _lockedTargetUntilTicks, 0);
+            }
             _resetMeterFlag = true;
-            Thread.Sleep(100);
-            RefreshAllOnWorker();
-            DevicesChanged?.Invoke();
+            EnqueueWork(() =>
+            {
+                RefreshAllOnWorker();
+                DevicesChanged?.Invoke();
+            });
         });
     }
 
@@ -178,7 +242,8 @@ public sealed class AudioDeviceService : IDisposable
                 for (int i = 0; i < sessions.Count; i++)
                 {
                     var s = sessions[i];
-                    if ((int)s.GetProcessID == processId)
+                    bool match = processId == 0 ? s.IsSystemSoundsSession : ((int)s.GetProcessID == processId && !s.IsSystemSoundsSession);
+                    if (match)
                     {
                         s.SimpleAudioVolume.Volume = clamped;
                     }
@@ -193,8 +258,9 @@ public sealed class AudioDeviceService : IDisposable
         if (_disposed) return;
 
         _cachedMixer = _cachedMixer
-            .Select(s => s.ProcessId == processId ? s with { IsMuted = muted } : s)
+            .Select(s => s.ProcessId == processId ? s with { IsMuted = muted, IsGeneratingSound = muted ? false : s.IsGeneratingSound } : s)
             .ToList();
+        Interlocked.Increment(ref _mixerVersion);
 
         EnqueueWork(() =>
         {
@@ -206,7 +272,8 @@ public sealed class AudioDeviceService : IDisposable
                 for (int i = 0; i < sessions.Count; i++)
                 {
                     var s = sessions[i];
-                    if ((int)s.GetProcessID == processId)
+                    bool match = processId == 0 ? s.IsSystemSoundsSession : ((int)s.GetProcessID == processId && !s.IsSystemSoundsSession);
+                    if (match)
                     {
                         s.SimpleAudioVolume.Mute = muted;
                     }
@@ -346,6 +413,17 @@ public sealed class AudioDeviceService : IDisposable
                     _peakMaster = master;
                     _peakLeft = left;
                     _peakRight = right;
+
+                    if (DateTimeOffset.UtcNow.UtcTicks >= Interlocked.Read(ref _masterVolLockUntilTicks))
+                    {
+                        try
+                        {
+                            var epVol = activeDevice.AudioEndpointVolume;
+                            _masterVolumePercent = Math.Clamp((int)Math.Round(epVol.MasterVolumeLevelScalar * 100f), 0, 100);
+                            _masterMuted = epVol.Mute;
+                        }
+                        catch { }
+                    }
                 }
                 catch
                 {
@@ -429,6 +507,7 @@ public sealed class AudioDeviceService : IDisposable
             if (a[i].ProcessId != b[i].ProcessId ||
                 a[i].IsMuted != b[i].IsMuted ||
                 a[i].IsActive != b[i].IsActive ||
+                a[i].IsGeneratingSound != b[i].IsGeneratingSound ||
                 Math.Abs(a[i].Volume - b[i].Volume) > 0.01f ||
                 !string.Equals(a[i].DisplayName, b[i].DisplayName, StringComparison.Ordinal))
             {
@@ -452,12 +531,22 @@ public sealed class AudioDeviceService : IDisposable
     {
         var list = new List<AudioDeviceInfo>();
         string? defaultId = null;
-        try
+
+        var lockedId = _lockedTargetDeviceId;
+        if (!string.IsNullOrEmpty(lockedId) &&
+            DateTimeOffset.UtcNow.UtcTicks < Interlocked.Read(ref _lockedTargetUntilTicks))
         {
-            using var def = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-            defaultId = def.ID;
+            defaultId = lockedId;
         }
-        catch { }
+        else
+        {
+            try
+            {
+                using var def = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                defaultId = def.ID;
+            }
+            catch { }
+        }
 
         try
         {
@@ -492,34 +581,74 @@ public sealed class AudioDeviceService : IDisposable
                 var session = sessions[i];
                 if (session.State == AudioSessionState.AudioSessionStateExpired) continue;
 
-                int pid = (int)session.GetProcessID;
-                if (pid <= 0 || session.IsSystemSoundsSession) continue;
+                bool isSystemSounds = session.IsSystemSoundsSession;
+                int pid = isSystemSounds ? 0 : (int)session.GetProcessID;
+                if (!isSystemSounds && pid <= 0) continue;
                 if (!seenPids.Add(pid)) continue;
 
-                string procName = "";
-                string displayName = session.DisplayName ?? "";
-                try
+                string procName;
+                string displayName;
+                string? exePath = null;
+
+                if (isSystemSounds)
                 {
-                    using var proc = Process.GetProcessById(pid);
-                    procName = proc.ProcessName;
-                    if (string.IsNullOrWhiteSpace(displayName) || displayName.StartsWith("@", StringComparison.Ordinal))
-                    {
-                        displayName = FriendlyProcessName(procName);
-                    }
+                    procName = "__system_sounds__";
+                    displayName = "系统声音";
+                    var sysDir = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                    var sndVol = Path.Combine(sysDir, "SndVol.exe");
+                    exePath = File.Exists(sndVol) ? sndVol : Path.Combine(sysDir, "imageres.dll");
                 }
-                catch
+                else
                 {
-                    continue;
+                    displayName = session.DisplayName ?? "";
+                    try
+                    {
+                        using var proc = Process.GetProcessById(pid);
+                        procName = proc.ProcessName;
+                        // 过滤 Windows 音频设备图形隔离系统守护进程 audiodg
+                        if (procName.Equals("audiodg", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+                        try { exePath = proc.MainModule?.FileName; } catch { }
+                        if (string.IsNullOrWhiteSpace(displayName) || displayName.StartsWith("@", StringComparison.Ordinal))
+                        {
+                            displayName = FriendlyProcessName(procName);
+                        }
+                    }
+                    catch
+                    {
+                        continue;
+                    }
                 }
 
                 float vol = 1f;
                 bool muted = false;
+                float peak = 0f;
                 try
                 {
                     vol = session.SimpleAudioVolume.Volume;
                     muted = session.SimpleAudioVolume.Mute;
+                    peak = session.AudioMeterInformation.MasterPeakValue;
                 }
                 catch { }
+
+                bool isActive = session.State == AudioSessionState.AudioSessionStateActive;
+                bool isGeneratingSound = isActive && !muted && vol > 0.001f && peak > 0.0015f;
+
+                byte[]? iconBytes = null;
+                if (!string.IsNullOrWhiteSpace(procName))
+                {
+                    if (!_mixerIconCache.TryGetValue(procName, out iconBytes) && !string.IsNullOrWhiteSpace(exePath))
+                    {
+                        try
+                        {
+                            iconBytes = PolicyConfigInterop.ExtractExeIconPngAsync(exePath).GetAwaiter().GetResult();
+                            _mixerIconCache[procName] = iconBytes;
+                        }
+                        catch { }
+                    }
+                }
 
                 result.Add(new MixerSessionInfo(
                     SessionKey: $"{pid}",
@@ -528,7 +657,9 @@ public sealed class AudioDeviceService : IDisposable
                     ProcessName: procName,
                     Volume: Math.Clamp(vol, 0f, 1f),
                     IsMuted: muted,
-                    IsActive: session.State == AudioSessionState.AudioSessionStateActive));
+                    IsActive: isActive,
+                    IsGeneratingSound: isGeneratingSound,
+                    AppIconBytes: iconBytes));
             }
         }
         catch (Exception ex)
@@ -536,8 +667,10 @@ public sealed class AudioDeviceService : IDisposable
             _log($"读取音量合成器失败：{ex.Message}");
         }
 
+        // 「系统声音」(ProcessId == 0) 始终固定在列表顶部，与 Windows 音量合成器一致
         return result
-            .OrderByDescending(x => x.IsActive)
+            .OrderByDescending(x => x.ProcessId == 0)
+            .ThenByDescending(x => x.IsActive)
             .ThenBy(x => x.DisplayName, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
@@ -562,14 +695,13 @@ public sealed class AudioDeviceService : IDisposable
                 IsActive: !isEnabled,
                 IsSupported: true));
 
+            // 仅枚举 Windows 11 系统空间音效下拉列表展示的 4 项标准格式（排除未授权的 DTS:X Ultra 等底层引擎项）
             var candidates = new (string Subtype, string Name)[]
             {
                 (SpatialAudioFormatSubtype.DolbyAtmosForSpeakers, "Dolby Atmos for Speakers"),
                 (SpatialAudioFormatSubtype.WindowsSonic, "用于耳机的 Windows Sonic"),
                 (SpatialAudioFormatSubtype.DolbyAtmosForHeadphones, "Dolby Atmos for Headphones"),
-                (SpatialAudioFormatSubtype.DolbyAtmosForHomeTheater, "Dolby Atmos for Home Theater"),
                 (SpatialAudioFormatSubtype.DTSHeadphoneX, "DTS Headphone:X"),
-                (SpatialAudioFormatSubtype.DTSXUltra, "DTS:X Ultra"),
             };
 
             foreach (var (subtype, name) in candidates)
@@ -601,6 +733,7 @@ public sealed class AudioDeviceService : IDisposable
         }
 
         bool isHeadphone = false;
+        bool isDisplayAudio = false;
         bool isBluetooth = false;
 
         try
@@ -609,9 +742,17 @@ public sealed class AudioDeviceService : IDisposable
             if (props.Contains(PkeyEndpointFormFactor))
             {
                 var raw = props[PkeyEndpointFormFactor].Value;
-                if (raw is uint formFactor && (formFactor == 3 || formFactor == 5))
+                if (raw is uint formFactor)
                 {
-                    isHeadphone = true;
+                    if (formFactor == 3 || formFactor == 5)
+                    {
+                        isHeadphone = true;
+                    }
+                    else if (formFactor == 8 || formFactor == 9)
+                    {
+                        // 8 = SPDIF, 9 = DigitalAudioDisplayDevice (HDMI / DisplayPort)
+                        isDisplayAudio = true;
+                    }
                 }
             }
 
@@ -661,11 +802,25 @@ public sealed class AudioDeviceService : IDisposable
             isBluetooth = true;
         }
 
+        if (!isHeadphone && !isDisplayAudio && (
+            fullName.Contains("HDMI", StringComparison.OrdinalIgnoreCase) ||
+            fullName.Contains("DisplayPort", StringComparison.OrdinalIgnoreCase) ||
+            fullName.Contains("NVIDIA High Definition Audio", StringComparison.OrdinalIgnoreCase) ||
+            fullName.Contains("AMD High Definition Audio", StringComparison.OrdinalIgnoreCase) ||
+            fullName.Contains("显示器", StringComparison.OrdinalIgnoreCase)))
+        {
+            isDisplayAudio = true;
+        }
+
+        var kind = isHeadphone
+            ? AudioOutputKind.Headphone
+            : (isDisplayAudio ? AudioOutputKind.DisplayAudio : AudioOutputKind.Speaker);
+
         return new AudioDeviceInfo(
             Id: dev.ID,
             Name: fullName,
             ShortName: shortName,
-            Kind: isHeadphone ? AudioOutputKind.Headphone : AudioOutputKind.Speaker,
+            Kind: kind,
             IsBluetooth: isBluetooth,
             IsDefault: isDefault);
     }

@@ -329,6 +329,24 @@ internal static class PolicyConfigInterop
     [DllImport("user32.dll")]
     private static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLong")]
+    private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    private const int GWL_EXSTYLE = -20;
+    private const int WS_EX_TOOLWINDOW = 0x00000080;
+
     [DllImport("user32.dll")]
     private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
@@ -350,18 +368,60 @@ internal static class PolicyConfigInterop
         if (title.Equals("Default IME", StringComparison.OrdinalIgnoreCase) ||
             title.Equals("MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
             title.Equals("GDI+ Window", StringComparison.OrdinalIgnoreCase) ||
-            title.StartsWith("GDI+ Window", StringComparison.OrdinalIgnoreCase))
+            title.StartsWith("GDI+ Window", StringComparison.OrdinalIgnoreCase) ||
+            title.Equals("MS_WebcheckMonitor", StringComparison.OrdinalIgnoreCase) ||
+            title.Equals("OleMainThreadWndName", StringComparison.OrdinalIgnoreCase) ||
+            title.Equals("DWM Notification Window", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
         if (className.Equals("IME", StringComparison.OrdinalIgnoreCase) ||
             className.Equals("MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
             className.Equals("CiceroUIWndFrame", StringComparison.OrdinalIgnoreCase) ||
-            className.Equals("DummyDWMListenerWindow", StringComparison.OrdinalIgnoreCase))
+            className.Equals("DummyDWMListenerWindow", StringComparison.OrdinalIgnoreCase) ||
+            className.Equals("Chrome_SystemMessageWindow", StringComparison.OrdinalIgnoreCase) ||
+            className.Equals("Chrome_MessageWindow", StringComparison.OrdinalIgnoreCase) ||
+            className.Equals("OleMainThreadWndClass", StringComparison.OrdinalIgnoreCase) ||
+            className.Equals("tooltips_class32", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// 过滤掉 0x0 辅助/托盘/消息窗口与 ToolWindow，避免软件主窗口被关闭后错误命中隐藏假窗口。
+    /// </summary>
+    private static bool IsRealCandidateWindow(IntPtr hWnd, string className, bool isVisible)
+    {
+        // 已知播放器主窗口类名直接放行
+        if (className.Equals("OrpheusBrowserHost", StringComparison.OrdinalIgnoreCase) ||
+            className.Equals("TXGuiFoundation", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        int exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
+        if ((exStyle & WS_EX_TOOLWINDOW) != 0)
+        {
+            return false;
+        }
+
+        if (GetWindowRect(hWnd, out var rc))
+        {
+            int w = rc.Right - rc.Left;
+            int h = rc.Bottom - rc.Top;
+            if (!isVisible)
+            {
+                // 隐藏窗口必须具备合理的主窗口尺寸，过滤 0x0 / 1x1 后台辅助窗
+                if (w < 120 || h < 80) return false;
+            }
+            else if (!IsIconic(hWnd))
+            {
+                if (w < 80 || h < 60) return false;
+            }
+        }
+        return true;
     }
 
     [DllImport("user32.dll")]
@@ -388,7 +448,12 @@ internal static class PolicyConfigInterop
         return copied > 0 ? new string(buf, 0, copied) : string.Empty;
     }
 
-    public static bool ActivateWindowByProcessIdOrName(int processId, string? hintProcessName, string? displayName = null)
+    public static bool ActivateWindowByProcessIdOrName(
+        int processId,
+        string? hintProcessName,
+        string? displayName = null,
+        string? exePath = null,
+        bool hasAppsFolderEntry = false)
     {
         IntPtr targetHwnd = IntPtr.Zero;
         IntPtr fallbackHiddenHwnd = IntPtr.Zero;
@@ -461,30 +526,115 @@ internal static class PolicyConfigInterop
             }
         }
 
-        if (targetHwnd == IntPtr.Zero)
+        // 5) 命中可见主窗口：直接激活或闪烁提醒
+        if (targetHwnd != IntPtr.Zero)
         {
-            targetHwnd = fallbackHiddenHwnd;
-        }
-        if (targetHwnd == IntPtr.Zero) return false;
+            IntPtr currentFg = GetForegroundWindow();
+            bool alreadyActive = !IsIconic(targetHwnd) && IsWindowVisible(targetHwnd) &&
+                (currentFg == targetHwnd ||
+                 (targetHwnd == _lastActivatedHwnd && (DateTimeOffset.UtcNow - _lastActivatedAt).TotalSeconds < 6));
 
-        IntPtr currentFg = GetForegroundWindow();
-        bool alreadyActive = !IsIconic(targetHwnd) && IsWindowVisible(targetHwnd) &&
-            (currentFg == targetHwnd ||
-             (targetHwnd == _lastActivatedHwnd && (DateTimeOffset.UtcNow - _lastActivatedAt).TotalSeconds < 6));
+            if (alreadyActive)
+            {
+                BringWindowToFront(targetHwnd);
+                FlashWindowAndTaskbar(targetHwnd);
+                _lastActivatedHwnd = targetHwnd;
+                _lastActivatedAt = DateTimeOffset.UtcNow;
+                return true;
+            }
 
-        if (alreadyActive)
-        {
-            BringWindowToFront(targetHwnd);
-            FlashWindowAndTaskbar(targetHwnd);
+            bool ok = BringWindowToFront(targetHwnd);
             _lastActivatedHwnd = targetHwnd;
             _lastActivatedAt = DateTimeOffset.UtcNow;
-            return true;
+            return ok;
         }
 
-        bool ok = BringWindowToFront(targetHwnd);
-        _lastActivatedHwnd = targetHwnd;
-        _lastActivatedAt = DateTimeOffset.UtcNow;
-        return ok;
+        // 6) 若只有隐藏主窗口（如最小化到托盘），尝试恢复并校验是否真的变为可见
+        if (fallbackHiddenHwnd != IntPtr.Zero)
+        {
+            BringWindowToFront(fallbackHiddenHwnd);
+            if (IsWindowVisible(fallbackHiddenHwnd))
+            {
+                _lastActivatedHwnd = fallbackHiddenHwnd;
+                _lastActivatedAt = DateTimeOffset.UtcNow;
+                return true;
+            }
+        }
+
+        // 7) 窗口已被关闭/销毁（或隐藏窗口拒绝直接 ShowWindow）：通过 Shell AppsFolder AUMID 或可执行文件重新拉起/唤醒单实例主窗口
+        return TryRelaunchOrActivateApp(hintProcessName, hasAppsFolderEntry, exePath, candidates);
+    }
+
+    private static bool TryRelaunchOrActivateApp(
+        string? rawAppId,
+        bool hasAppsFolderEntry,
+        string? exePath,
+        List<string> candidateProcessNames)
+    {
+        // 7.1 优先通过 Windows Shell AppsFolder 激活（原生支持 UWP/MSIX、Store 版 Spotify、Zen/Firefox 哈希 AUMID 等）
+        if (!string.IsNullOrWhiteSpace(rawAppId) && (hasAppsFolderEntry || rawAppId.Contains('!')))
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "explorer.exe",
+                    Arguments = $"shell:AppsFolder\\{rawAppId}",
+                    UseShellExecute = true,
+                });
+                return true;
+            }
+            catch { }
+        }
+
+        // 7.2 桌面单实例程序（网易云、QQ音乐、PotPlayer 等）：重新拉起主 exe 即可唤醒托盘实例或新开窗口
+        string? resolvedExe = exePath;
+        if (string.IsNullOrWhiteSpace(resolvedExe) || !File.Exists(resolvedExe))
+        {
+            resolvedExe = FindExePathFromRunningProcesses(candidateProcessNames);
+        }
+
+        if (!string.IsNullOrWhiteSpace(resolvedExe) && File.Exists(resolvedExe))
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = resolvedExe,
+                    UseShellExecute = true,
+                });
+                return true;
+            }
+            catch { }
+        }
+
+        return false;
+    }
+
+    private static string? FindExePathFromRunningProcesses(List<string> candidates)
+    {
+        foreach (var name in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            try
+            {
+                foreach (var proc in Process.GetProcessesByName(name))
+                {
+                    try
+                    {
+                        var path = proc.MainModule?.FileName;
+                        if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                        {
+                            return path;
+                        }
+                    }
+                    catch { }
+                    finally { proc.Dispose(); }
+                }
+            }
+            catch { }
+        }
+        return null;
     }
 
     /// <summary>针对多进程架构播放器（如网易云音乐音频子进程与 UI 主进程分离），按 PID + 进程名联合查找主窗口。</summary>
@@ -536,7 +686,10 @@ internal static class PolicyConfigInterop
             var cls = GetWindowClassName(hWnd);
             if (IsDummySystemWindow(hWnd, title, cls)) return true;
 
-            if (IsWindowVisible(hWnd))
+            bool visible = IsWindowVisible(hWnd);
+            if (!IsRealCandidateWindow(hWnd, cls, visible)) return true;
+
+            if (visible)
             {
                 // 优先无 Owner 的顶层主窗口
                 if (GetWindow(hWnd, GW_OWNER) == IntPtr.Zero)

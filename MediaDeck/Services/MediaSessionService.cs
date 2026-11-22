@@ -12,6 +12,8 @@ public sealed record MediaInstanceInfo
     public required string SourceAppId { get; init; }
     public required string SourceDisplayName { get; init; }
     public int ProcessId { get; init; }
+    public string? ExePath { get; init; }
+    public bool HasAppsFolderEntry { get; init; }
     public bool IsFallback { get; init; }
     public string Title { get; init; } = "";
     public string Artist { get; init; } = "";
@@ -116,6 +118,20 @@ public sealed class MediaSessionService : IDisposable
             if (list.Count == 0) return null;
             int idx = SelectedIndex;
             return idx >= 0 && idx < list.Count ? list[idx] : list[0];
+        }
+    }
+
+    /// <summary>
+    /// 胶囊形态展示的实例：与卡片一致按新旧（最近活跃）排序，但优先展示正在播放的实例
+    /// （例如最新实例暂停、第二实例仍在播放时，胶囊自动切换显示第二实例；若全部暂停则显示最新实例）。
+    /// </summary>
+    public MediaInstanceInfo? CompactInstance
+    {
+        get
+        {
+            var list = _instances;
+            if (list.Count == 0) return null;
+            return list.FirstOrDefault(x => x.IsPlaying) ?? list[0];
         }
     }
 
@@ -309,9 +325,15 @@ public sealed class MediaSessionService : IDisposable
         }
     }
 
-    public async Task TogglePlayPauseAsync()
+    public MediaInstanceInfo? GetInstanceById(string? instanceId)
     {
-        var cur = CurrentInstance;
+        if (string.IsNullOrWhiteSpace(instanceId)) return CurrentInstance;
+        return _instances.FirstOrDefault(x => string.Equals(x.Id, instanceId, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public async Task TogglePlayPauseAsync(string? instanceId = null)
+    {
+        var cur = GetInstanceById(instanceId);
         if (cur is null) return;
 
         if (cur.SmtcSession is not null)
@@ -340,9 +362,9 @@ public sealed class MediaSessionService : IDisposable
         }
     }
 
-    public async Task NextAsync()
+    public async Task NextAsync(string? instanceId = null)
     {
-        var cur = CurrentInstance;
+        var cur = GetInstanceById(instanceId);
         if (cur is null) return;
 
         if (cur.SmtcSession is not null)
@@ -365,9 +387,9 @@ public sealed class MediaSessionService : IDisposable
         }
     }
 
-    public async Task PreviousAsync()
+    public async Task PreviousAsync(string? instanceId = null)
     {
-        var cur = CurrentInstance;
+        var cur = GetInstanceById(instanceId);
         if (cur is null) return;
 
         if (cur.SmtcSession is not null)
@@ -391,9 +413,9 @@ public sealed class MediaSessionService : IDisposable
     }
 
     /// <summary>跳转进度。返回 true 表示播放器原生支持 Seek；返回 false 表示仅校准了本地歌词进度（如网易云兜底）。</summary>
-    public async Task<bool> SeekAsync(TimeSpan target)
+    public async Task<bool> SeekAsync(TimeSpan target, string? instanceId = null)
     {
-        var cur = CurrentInstance;
+        var cur = GetInstanceById(instanceId);
         if (cur is null || cur.Duration <= TimeSpan.Zero) return true;
 
         var clamped = TimeSpan.FromTicks(Math.Clamp(target.Ticks, 0, cur.Duration.Ticks));
@@ -427,64 +449,67 @@ public sealed class MediaSessionService : IDisposable
     }
 
     /// <summary>
-    /// 定时暂停到期执行：
-    ///   - 若当前有任何实例正在播放，则暂停所有正在播放的实例，并返回 true；
-    ///   - 若当前没有任何媒体正在播放，则按用户预期将行为替换为触发播放，并返回 false。
+    /// 分实例定时暂停到期执行：
+    ///   - 若目标实例正在播放，则暂停该实例，返回 (Paused: true, DisplayName)；
+    ///   - 若目标实例当前未在播放，则按约定触发该实例播放，返回 (Paused: false, DisplayName)；
+    ///   - 若目标实例已退出，则返回 (Paused: true, DisplayName: "") 不误触其他播放器。
     /// </summary>
-    public async Task<bool> ExecuteSleepTimerActionAsync()
+    public async Task<(bool Paused, string DisplayName)> ExecuteSleepTimerActionAsync(string instanceId)
     {
-        var playingList = _instances.Where(x => x.IsPlaying).ToList();
-        if (playingList.Count > 0)
+        var target = _instances.FirstOrDefault(x => string.Equals(x.Id, instanceId, StringComparison.OrdinalIgnoreCase));
+        if (target is null)
         {
-            foreach (var inst in playingList)
+            return (true, "");
+        }
+
+        if (target.IsPlaying)
+        {
+            if (target.SmtcSession is not null)
             {
-                if (inst.SmtcSession is not null)
+                try { await target.SmtcSession.TryPauseAsync(); } catch { }
+            }
+            else if (target.IsFallback)
+            {
+                if (target.SourceAppId.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
                 {
-                    try { await inst.SmtcSession.TryPauseAsync(); } catch { }
+                    _netEaseElog.NotifyOptimisticTogglePlayPause();
                 }
-                else if (inst.IsFallback)
-                {
-                    if (inst.SourceAppId.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
-                    {
-                        _netEaseElog.NotifyOptimisticTogglePlayPause();
-                    }
-                    PolicyConfigInterop.ControlFallbackPlayer(inst.SourceAppId, inst.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
-                }
+                PolicyConfigInterop.ControlFallbackPlayer(target.SourceAppId, target.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
             }
             await Task.Delay(180).ConfigureAwait(false);
             await RefreshAsync().ConfigureAwait(false);
-            return true;
+            return (true, target.SourceDisplayName);
         }
 
-        // 当前没有任何媒体在播放：触发当前选中实例（或系统媒体键）开始播放
-        var cur = CurrentInstance;
-        if (cur?.SmtcSession is not null)
+        // 目标实例未在播放：触发该实例播放
+        if (target.SmtcSession is not null)
         {
-            try { await cur.SmtcSession.TryPlayAsync(); } catch { }
+            try { await target.SmtcSession.TryPlayAsync(); } catch { }
         }
-        else if (cur is not null && cur.IsFallback)
+        else if (target.IsFallback)
         {
-            if (cur.SourceAppId.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
+            if (target.SourceAppId.Contains("cloudmusic", StringComparison.OrdinalIgnoreCase))
             {
                 _netEaseElog.NotifyOptimisticTogglePlayPause();
             }
-            PolicyConfigInterop.ControlFallbackPlayer(cur.SourceAppId, cur.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
-        }
-        else
-        {
-            PolicyConfigInterop.SendMediaKey(PolicyConfigInterop.VK_MEDIA_PLAY_PAUSE);
+            PolicyConfigInterop.ControlFallbackPlayer(target.SourceAppId, target.ProcessId, PolicyConfigInterop.APPCOMMAND_MEDIA_PLAY_PAUSE);
         }
 
         await Task.Delay(180).ConfigureAwait(false);
         await RefreshAsync().ConfigureAwait(false);
-        return false;
+        return (false, target.SourceDisplayName);
     }
 
-    public bool ActivateCurrentSourceWindow()
+    public bool ActivateCurrentSourceWindow(string? instanceId = null)
     {
-        var cur = CurrentInstance;
+        var cur = GetInstanceById(instanceId);
         if (cur is null) return false;
-        return PolicyConfigInterop.ActivateWindowByProcessIdOrName(cur.ProcessId, cur.SourceAppId, cur.SourceDisplayName);
+        return PolicyConfigInterop.ActivateWindowByProcessIdOrName(
+            cur.ProcessId,
+            cur.SourceAppId,
+            cur.SourceDisplayName,
+            cur.ExePath,
+            cur.HasAppsFolderEntry);
     }
 
     private async Task<MediaInstanceInfo?> BuildSmtcInfoAsync(
@@ -554,6 +579,8 @@ public sealed class MediaSessionService : IDisposable
             SourceAppId = appId,
             SourceDisplayName = displayName,
             ProcessId = pid,
+            ExePath = exePath,
+            HasAppsFolderEntry = resolved is not null,
             IsFallback = false,
             Title = string.IsNullOrWhiteSpace(title) ? displayName : title,
             Artist = artist,
@@ -596,6 +623,8 @@ public sealed class MediaSessionService : IDisposable
                     SourceAppId = ms.ProcessName,
                     SourceDisplayName = ms.DisplayName,
                     ProcessId = ms.ProcessId,
+                    ExePath = exePath,
+                    HasAppsFolderEntry = false,
                     IsFallback = true,
                     NetEaseSongId = elogSnap.SongId,
                     Title = elogSnap.Title,
@@ -661,6 +690,8 @@ public sealed class MediaSessionService : IDisposable
             SourceAppId = ms.ProcessName,
             SourceDisplayName = ms.DisplayName,
             ProcessId = ms.ProcessId,
+            ExePath = exePath,
+            HasAppsFolderEntry = false,
             IsFallback = true,
             Title = title,
             Artist = artist,

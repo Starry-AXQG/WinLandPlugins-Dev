@@ -37,7 +37,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private const double BackAmplitude = 0.45;
     private const double CompactHeight = 40;
     private const double ExpandedHeight = 208;
-    private const int WavePointsCount = 22;
+    private const int WavePointsCount = 72;
 
     // Quietify SVG 关键帧（viewBox 0 0 135 140）
     private static readonly double[] QuietifyHeights = [120, 110, 100, 90, 80, 70, 60, 50, 40, 140, 120];
@@ -103,6 +103,10 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private double _cursorSmoothX = 280;
     private double _cursorSmoothY = 100;
     private double _cursorSmoothOpacity;
+    private bool _cursorGlowEnabled = true;
+    private double _cursorGlowSize = 96.0;
+    private double _cursorGlowOpacity = 0.30;
+    private double _contourReactivity = 0.50;
 
     // 封面提取的目标主色与当前平滑主色
     private Color _targetCoverLeft = Color.FromArgb(255, 56, 189, 248);
@@ -117,10 +121,12 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private double _auroraPhase2;
     private double _auroraPhase3;
     private double _smoothMaster;
+    private double _slowMaster;
     private double _smoothLeft;
     private double _smoothRight;
     private VisualEffectMode _visualMode = VisualEffectMode.AuroraWave;
     private bool _isPlaying;
+    private bool _compactIsPlaying;
 
     // 形态变形动画状态
     private readonly DispatcherQueueTimer? _morphTimer;
@@ -161,8 +167,6 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private readonly Image _sourceIconImg;
     private readonly FontIcon _sourceIconFallback;
     private readonly StackPanel _dotsPanel;
-    private readonly Border _timerBadge;
-    private readonly TextBlock _timerBadgeText;
     private readonly Button _outputBtn;
     private readonly FontIcon _outputGlyph;
     private readonly Border _btBadge;
@@ -177,7 +181,18 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private readonly TextBlock _lyricCurr;
     private readonly TextBlock _lyricNext;
 
-    // ==================== 展开态底部居中控制 + 右侧喇叭与自下而上弹出音量条 ====================
+    // ==================== 展开态底部：左侧闹钟定时 + 居中播放控制 + 右侧喇叭音量 ====================
+    private readonly Button _alarmBtn;
+    private readonly FontIcon _alarmBtnGlyph;
+    private readonly Border _alarmInlineBadge;
+    private readonly TextBlock _alarmInlineText;
+    private readonly Border _alarmPopup;
+    private readonly StackPanel _alarmPopupList;
+    private bool _alarmPopupOpen;
+    private string? _currentInstanceId;
+    private bool _currentHasTimer;
+    private TimeSpan _currentTimerRemaining;
+
     private readonly FontIcon _playPauseGlyph;
     private readonly Button _volumeBtn;
     private readonly FontIcon _volumeBtnGlyph;
@@ -205,10 +220,15 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private readonly StackPanel _deviceDropdownList;
     private bool _dropdownOpen;
 
-    // 鼠标坐标跟随的提示文本
+    // 延迟 1000ms 显示的固定锚点悬停提示文本（离开按钮隐藏）
     private readonly Canvas _hintCanvas;
     private readonly Border _hintPill;
     private readonly TextBlock _hintText;
+    private readonly DispatcherQueueTimer? _hintDelayTimer;
+    private UIElement? _hintTarget;
+    private Func<string>? _hintTextProvider;
+    private Point _hintPendingPt;
+    private bool _hintVisible;
 
     // 手势与进度条拖动状态
     private bool _isPointerDown;
@@ -219,6 +239,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     // 缓存状态
     private byte[]? _lastCoverBytes;
+    private byte[]? _lastCompactCoverBytes;
     private byte[]? _lastAppIconBytes;
     private string _currentSourceName = "媒体播放器";
     private TimeSpan _currentDuration = TimeSpan.Zero;
@@ -235,6 +256,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
     public event Action<string>? SwitchOutputDeviceRequested;
     public event Action<int>? MasterVolumeChangedRequested;
     public event Action<int>? MasterVolumeStepRequested;
+    public event Action<string, int>? SetSleepTimerRequested;
 
     public MediaDeckView(
         IIslandTheme theme,
@@ -491,25 +513,6 @@ public sealed class MediaDeckView : UserControl, IMorphView
         };
         AttachCursorHint(dotsHoverHost, () => "滚轮、左右滑动或点击圆点切换媒体实例");
 
-        _timerBadgeText = new TextBlock
-        {
-            FontSize = 10.5,
-            FontWeight = FontWeights.SemiBold,
-            Foreground = _accentCyanBrush,
-        };
-        _timerBadge = new Border
-        {
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(7, 2, 7, 2),
-            Background = _subtleFillBrush,
-            Opacity = 0,
-            Height = 0,
-            HorizontalAlignment = HorizontalAlignment.Right,
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 0, 38, 0),
-            Child = _timerBadgeText,
-        };
-
         // 2.3 右上角：音频输出类型图标 + 蓝牙角标
         _outputGlyph = new FontIcon
         {
@@ -552,7 +555,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         var topBar = new Grid
         {
             Height = 28,
-            Children = { _sourceBtn, dotsHoverHost, _timerBadge, _outputBtn },
+            Children = { _sourceBtn, dotsHoverHost, _outputBtn },
         };
 
         // 2.4 中部左侧：专辑封面 + 歌名/歌手/来源名
@@ -691,6 +694,44 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Children = { prevBtn, playBtn, nextBtn },
         };
 
+        // 左对齐闹钟定时暂停按钮（与左上角来源图标同左边距、与右侧喇叭图标对称）
+        _alarmBtnGlyph = new FontIcon
+        {
+            Glyph = "\uE916",
+            FontSize = 14.5,
+            Foreground = _textBrush,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        _alarmBtn = CreateInteractiveIconButton(_alarmBtnGlyph, 32, 28, cornerRadius: 8, isPrimaryPill: false);
+        _alarmBtn.HorizontalAlignment = HorizontalAlignment.Left;
+        _alarmBtn.VerticalAlignment = VerticalAlignment.Center;
+        _alarmBtn.Click += (_, _) => ToggleAlarmPopup();
+        AttachCursorHint(_alarmBtn, () => _currentHasTimer
+            ? $"定时暂停：剩余 {FormatTime(_currentTimerRemaining)}（点击修改/取消）"
+            : "为当前实例设置定时暂停");
+
+        _alarmInlineText = new TextBlock
+        {
+            FontSize = 10.5,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = _accentCyanBrush,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        _alarmInlineBadge = new Border
+        {
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(6, 1, 6, 1),
+            Background = _subtleFillBrush,
+            Opacity = 0,
+            Height = 0,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(36, 0, 0, 0),
+            IsHitTestVisible = false,
+            Child = _alarmInlineText,
+        };
+
         // 右对齐喇叭按钮（Width = 32, HorizontalAlignment = Right，与右上角 _outputBtn 严格同右边距）
         _volumeBtnGlyph = new FontIcon
         {
@@ -718,7 +759,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         var transportBarGrid = new Grid
         {
             Margin = new Thickness(0, 2, 0, 0),
-            Children = { transportCenterStack, _volumeBtn },
+            Children = { _alarmBtn, _alarmInlineBadge, transportCenterStack, _volumeBtn },
         };
 
         // 2.7 最底行：全宽进度条 + 左右时间戳
@@ -911,9 +952,35 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Child = dropdownScroll,
         };
         _deviceDropdown.Tapped += (_, e) => e.Handled = true;
-        _deviceDropdown.PointerWheelChanged += (_, e) => e.Handled = true;
 
-        // 2.10 以鼠标坐标为左顶点的文本提示层
+        // 2.95 卡片内分实例定时暂停弹出菜单（带内部滚动适配，对齐左下角闹钟图标正上方）
+        _alarmPopupList = new StackPanel { Spacing = 2, Padding = new Thickness(5) };
+        var alarmScroll = new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            MaxHeight = 132,
+            Content = _alarmPopupList,
+        };
+        _alarmPopup = new Border
+        {
+            Width = 156,
+            MaxHeight = 136,
+            Height = 0,
+            Opacity = 0,
+            IsHitTestVisible = false,
+            CornerRadius = new CornerRadius(10),
+            Background = _dropdownBgBrush,
+            BorderBrush = _subtleBorderBrush,
+            BorderThickness = new Thickness(1),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Bottom,
+            Margin = new Thickness(0, 0, 0, 52),
+            Child = alarmScroll,
+        };
+        _alarmPopup.Tapped += (_, e) => e.Handled = true;
+
+        // 2.10 固定锚点式悬停提示文本层
         _hintText = new TextBlock { FontSize = 11, Foreground = _textBrush };
         _hintPill = new Border
         {
@@ -953,7 +1020,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Opacity = 0,
             IsHitTestVisible = false,
             Padding = new Thickness(16, 10, 16, 10),
-            Children = { expandedContent, _volumePopupHost, _deviceDropdown, _hintCanvas },
+            Children = { expandedContent, _volumePopupHost, _alarmPopup, _deviceDropdown, _hintCanvas },
         };
 
         // 根容器
@@ -991,6 +1058,15 @@ public sealed class MediaDeckView : UserControl, IMorphView
             _pageAnimTimer.Tick += (_, _) => OnPageAnimTick();
         }
 
+        // 悬停提示 1000ms 延迟触发定时器
+        _hintDelayTimer = DispatcherQueue?.CreateTimer();
+        if (_hintDelayTimer is not null)
+        {
+            _hintDelayTimer.Interval = TimeSpan.FromMilliseconds(1000);
+            _hintDelayTimer.IsRepeating = false;
+            _hintDelayTimer.Tick += (_, _) => OnHintDelayElapsed();
+        }
+
         // 30fps 主视觉定时器（驱动极光波浪 / 封面轮廓光 / 胶囊歌词滚动 / 胶囊 Quietify 波形 / 音量条弹出收回动画）
         _auroraTimer = DispatcherQueue?.CreateTimer();
         if (_auroraTimer is not null)
@@ -1004,10 +1080,23 @@ public sealed class MediaDeckView : UserControl, IMorphView
         Loaded += (_, _) => _auroraTimer?.Start();
         Unloaded += (_, _) =>
         {
-            _morphTimer?.Stop();
-            _pageAnimTimer?.Stop();
-            _auroraTimer?.Stop();
+            _hintDelayTimer?.Stop();
+            HideHint();
+            // 仅在真正离开视觉树时停止动画，避免宿主短暂重挂视图导致主视觉循环永久停摆
+            if (!IsLoaded)
+            {
+                _morphTimer?.Stop();
+                _pageAnimTimer?.Stop();
+            }
         };
+    }
+
+    public void StopAllTimers()
+    {
+        _morphTimer?.Stop();
+        _pageAnimTimer?.Stop();
+        _auroraTimer?.Stop();
+        _hintDelayTimer?.Stop();
     }
 
     public UIElement View => this;
@@ -1017,13 +1106,48 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _visualMode = mode;
         _auroraWaveLayer.Opacity = mode == VisualEffectMode.AuroraWave ? 1 : 0;
         _contourGlowLayer.Opacity = mode == VisualEffectMode.AlbumContour ? 1 : 0;
+        if (mode != VisualEffectMode.Off)
+        {
+            EnsureAuroraTimerRunning();
+        }
     }
 
-    public void AnimateToExpanded(TimeSpan duration) => StartMorph(expanded: true, duration);
+    public void SetContourReactivity(double reactivityRatio)
+    {
+        _contourReactivity = Math.Clamp(reactivityRatio, 0.0, 5.0);
+    }
+
+    private void EnsureAuroraTimerRunning()
+    {
+        if (_auroraTimer is not null && !_auroraTimer.IsRunning)
+        {
+            _auroraTimer.Start();
+        }
+    }
+
+    public void SetCursorGlowSettings(bool enabled, double size, double opacity)
+    {
+        _cursorGlowEnabled = enabled;
+        _cursorGlowSize = Math.Clamp(size, 40.0, 320.0);
+        _cursorGlowOpacity = Math.Clamp(opacity, 0.0, 1.0);
+        _cursorGlowEllipse.Width = _cursorGlowSize;
+        _cursorGlowEllipse.Height = _cursorGlowSize;
+        if (!_cursorGlowEnabled || _cursorGlowOpacity <= 0.005)
+        {
+            _cursorGlowEllipse.Opacity = 0;
+        }
+    }
+
+    public void AnimateToExpanded(TimeSpan duration)
+    {
+        EnsureAuroraTimerRunning();
+        StartMorph(expanded: true, duration);
+    }
 
     public void AnimateToCompact(TimeSpan duration)
     {
         CloseDeviceDropdown();
+        CloseAlarmPopup();
         _isHoveringVolBtn = false;
         _isHoveringVolPopup = false;
         _isDraggingVolBar = false;
@@ -1031,15 +1155,38 @@ public sealed class MediaDeckView : UserControl, IMorphView
         StartMorph(expanded: false, duration);
     }
 
-    public void UpdateMedia(MediaInstanceInfo? current, int totalCount, int selectedIndex, LyricTriplet lyrics)
+    public void UpdateMedia(
+        MediaInstanceInfo? current,
+        int totalCount,
+        int selectedIndex,
+        LyricTriplet lyrics,
+        MediaInstanceInfo? compact,
+        LyricTriplet compactLyrics)
     {
+        // 1) 胶囊形态独立刷新：遵循「新旧优先 + 优先展示正在播放的实例」规则
+        if (compact is null)
+        {
+            _compactIsPlaying = false;
+            SetCompactText("声枢 · 暂无媒体", isLyric: false);
+            UpdateCompactQuietifyStatic();
+            UpdateCompactCoverImage(null);
+        }
+        else
+        {
+            _compactIsPlaying = compact.IsPlaying;
+            bool compactHasLyric = compactLyrics.HasSyncedLyrics && !string.IsNullOrWhiteSpace(compactLyrics.Current);
+            SetCompactText(compactHasLyric ? compactLyrics.Current : compact.Title, isLyric: compactHasLyric);
+            UpdateCompactQuietifyStatic();
+            UpdateCompactCoverImage(compact.ThumbnailBytes);
+        }
+
+        // 2) 展开卡片形态刷新：遵循卡片当前选中的实例
         if (current is null)
         {
+            _currentInstanceId = null;
             _isPlaying = false;
             _currentSourceName = "媒体播放器";
             _currentDuration = TimeSpan.Zero;
-            SetCompactText("声枢 · 暂无媒体", isLyric: false);
-            UpdateCompactQuietifyStatic();
             _titleText.Text = "暂无媒体播放";
             _artistText.Text = "播放音乐或视频后自动显示";
             _sourceNameText.Text = "声枢";
@@ -1053,16 +1200,20 @@ public sealed class MediaDeckView : UserControl, IMorphView
             UpdateCoverImage(null);
             UpdateAppIconImage(null);
             RebuildInstanceDots(0, -1);
+            CloseAlarmPopup();
             return;
         }
 
+        EnsureAuroraTimerRunning();
+        if (!string.Equals(_currentInstanceId, current.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            _currentInstanceId = current.Id;
+            _lastCoverBytes = null; // 切换实例时强制刷新封面与轮廓光主色，防止沿用上一个实例颜色
+            CloseAlarmPopup();
+        }
         _isPlaying = current.IsPlaying;
         _currentSourceName = current.SourceDisplayName;
         _currentDuration = current.Duration;
-
-        bool hasLyricLine = lyrics.HasSyncedLyrics && !string.IsNullOrWhiteSpace(lyrics.Current);
-        SetCompactText(hasLyricLine ? lyrics.Current : current.Title, isLyric: hasLyricLine);
-        UpdateCompactQuietifyStatic();
 
         _titleText.Text = current.Title;
         _artistText.Text = string.IsNullOrWhiteSpace(current.Artist)
@@ -1115,16 +1266,21 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     public void UpdateSleepTimer(bool isActive, TimeSpan remaining)
     {
-        if (isActive && remaining > TimeSpan.Zero)
+        _currentHasTimer = isActive && remaining > TimeSpan.Zero;
+        _currentTimerRemaining = _currentHasTimer ? remaining : TimeSpan.Zero;
+
+        if (_currentHasTimer)
         {
-            _timerBadgeText.Text = $"⏱ {FormatTime(remaining)}";
-            _timerBadge.Opacity = 1;
-            _timerBadge.Height = 18;
+            _alarmBtnGlyph.Foreground = _accentCyanBrush;
+            _alarmInlineText.Text = FormatTime(remaining);
+            _alarmInlineBadge.Opacity = 1;
+            _alarmInlineBadge.Height = 18;
         }
         else
         {
-            _timerBadge.Opacity = 0;
-            _timerBadge.Height = 0;
+            _alarmBtnGlyph.Foreground = _textBrush;
+            _alarmInlineBadge.Opacity = 0;
+            _alarmInlineBadge.Height = 0;
         }
     }
 
@@ -1178,7 +1334,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     private void UpdateCompactQuietifyStatic()
     {
-        if (!_isPlaying)
+        if (!_compactIsPlaying)
         {
             // 暂停状态：显示第 2 个图标（5 个水平圆点 y=70, height=15）
             for (int i = 0; i < 5; i++)
@@ -1248,7 +1404,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
                 }
             }
 
-            if (_isPlaying)
+            if (_compactIsPlaying)
             {
                 double sec = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
                 for (int i = 0; i < 5; i++)
@@ -1288,16 +1444,24 @@ public sealed class MediaDeckView : UserControl, IMorphView
             SyncMasterVolumeFromProvider();
         }
 
-        // 3) 鼠标中心圆形光效平滑跟随
+        // 3) 鼠标坐标平滑插值（同时驱动波浪/轮廓光物理避让场与可选圆形光效）
         double targetCursorOp = _isPointerInRoot ? 1.0 : 0.0;
         _cursorSmoothOpacity += (targetCursorOp - _cursorSmoothOpacity) * 0.22;
         if (_cursorSmoothOpacity > 0.01)
         {
             _cursorSmoothX += (_cursorRawX - _cursorSmoothX) * 0.32;
             _cursorSmoothY += (_cursorRawY - _cursorSmoothY) * 0.32;
-            Canvas.SetLeft(_cursorGlowEllipse, _cursorSmoothX - 64);
-            Canvas.SetTop(_cursorGlowEllipse, _cursorSmoothY - 64);
-            _cursorGlowEllipse.Opacity = _cursorSmoothOpacity;
+            if (_cursorGlowEnabled && _cursorGlowOpacity > 0.005)
+            {
+                double half = _cursorGlowSize * 0.5;
+                Canvas.SetLeft(_cursorGlowEllipse, _cursorSmoothX - half);
+                Canvas.SetTop(_cursorGlowEllipse, _cursorSmoothY - half);
+                _cursorGlowEllipse.Opacity = _cursorSmoothOpacity * _cursorGlowOpacity;
+            }
+            else
+            {
+                _cursorGlowEllipse.Opacity = 0;
+            }
         }
         else
         {
@@ -1314,13 +1478,15 @@ public sealed class MediaDeckView : UserControl, IMorphView
             double lCurve = Math.Pow(Math.Clamp(left, 0, 1), 0.65);
             double rCurve = Math.Pow(Math.Clamp(right, 0, 1), 0.65);
 
-            double targetM = _isPlaying ? Math.Max(mCurve, 0.12) : mCurve * 0.4;
-            double targetL = _isPlaying ? Math.Max(lCurve, 0.10) : lCurve * 0.4;
-            double targetR = _isPlaying ? Math.Max(rCurve, 0.10) : rCurve * 0.4;
+            bool anyPlaying = _isPlaying || _compactIsPlaying;
+            double targetM = anyPlaying ? Math.Max(mCurve, 0.12) : mCurve * 0.4;
+            double targetL = anyPlaying ? Math.Max(lCurve, 0.10) : lCurve * 0.4;
+            double targetR = anyPlaying ? Math.Max(rCurve, 0.10) : rCurve * 0.4;
 
-            _smoothMaster += (targetM - _smoothMaster) * (targetM > _smoothMaster ? 0.32 : 0.10);
-            _smoothLeft += (targetL - _smoothLeft) * (targetL > _smoothLeft ? 0.32 : 0.10);
-            _smoothRight += (targetR - _smoothRight) * (targetR > _smoothRight ? 0.32 : 0.10);
+            _smoothMaster += (targetM - _smoothMaster) * (targetM > _smoothMaster ? 0.35 : 0.12);
+            _slowMaster += (_smoothMaster - _slowMaster) * 0.05;
+            _smoothLeft += (targetL - _smoothLeft) * (targetL > _smoothLeft ? 0.35 : 0.12);
+            _smoothRight += (targetR - _smoothRight) * (targetR > _smoothRight ? 0.35 : 0.12);
 
             if (_visualMode == VisualEffectMode.AuroraWave)
             {
@@ -1348,12 +1514,12 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _waveRibbon2.Opacity = Math.Clamp(baseOp + _smoothRight * boost, 0.30, 0.96);
         _waveRibbon3.Opacity = Math.Clamp(baseOp * 0.85 + _smoothMaster * boost, 0.25, 0.92);
 
-        UpdateSingleWavePolygon(_waveRibbon1, _auroraPhase1, baseLine: 72 - _smoothLeft * 36, amp1: 14 + _smoothLeft * 32, amp2: 9 + _smoothMaster * 18, freq1: 1.9, freq2: 3.4);
-        UpdateSingleWavePolygon(_waveRibbon2, -_auroraPhase2, baseLine: 86 - _smoothRight * 38, amp1: 16 + _smoothRight * 34, amp2: 10 + _smoothLeft * 16, freq1: 2.2, freq2: 3.1);
-        UpdateSingleWavePolygon(_waveRibbon3, _auroraPhase3 * 0.85, baseLine: 102 - _smoothMaster * 42, amp1: 12 + _smoothMaster * 36, amp2: 11 + _smoothRight * 20, freq1: 2.6, freq2: 4.0);
+        UpdateSingleWavePolygon(_waveRibbon1, _auroraPhase1, baseLine: 72 - _smoothLeft * 36, amp1: 14 + _smoothLeft * 32, amp2: 9 + _smoothMaster * 18, freq1: 1.9, freq2: 3.4, maxPush: 24.0);
+        UpdateSingleWavePolygon(_waveRibbon2, -_auroraPhase2, baseLine: 86 - _smoothRight * 38, amp1: 16 + _smoothRight * 34, amp2: 10 + _smoothLeft * 16, freq1: 2.2, freq2: 3.1, maxPush: 30.0);
+        UpdateSingleWavePolygon(_waveRibbon3, _auroraPhase3 * 0.85, baseLine: 102 - _smoothMaster * 42, amp1: 12 + _smoothMaster * 36, amp2: 11 + _smoothRight * 20, freq1: 2.6, freq2: 4.0, maxPush: 36.0);
     }
 
-    private void UpdateSingleWavePolygon(Polygon poly, double phase, double baseLine, double amp1, double amp2, double freq1, double freq2)
+    private void UpdateSingleWavePolygon(Polygon poly, double phase, double baseLine, double amp1, double amp2, double freq1, double freq2, double maxPush)
     {
         var pts = poly.Points;
         if (pts.Count < WavePointsCount + 2) return;
@@ -1373,34 +1539,50 @@ public sealed class MediaDeckView : UserControl, IMorphView
                      + Math.Sin(normX * Math.PI * freq1 + phase) * amp1
                      + Math.Cos(normX * Math.PI * freq2 - phase * 1.25) * amp2;
 
-            // 鼠标避让物理场：波浪在靠近鼠标半径 140px 内产生柔和退让凹陷
-            if (evadeStrength > 0.02)
+            // 平滑流体物理避让场（C∞ 连续高斯衰减 + 双曲正切方向过渡，消除生硬折线与符号跳变）
+            if (evadeStrength > 0.01)
             {
                 double dx = x - mx;
                 double dy = y - my;
-                double dist = Math.Sqrt(dx * dx + dy * dy);
-                const double radius = 145.0;
-                if (dist < radius)
-                {
-                    double factor = 1.0 - dist / radius;
-                    double dirY = dy >= 0 ? 1.0 : -0.75; // 优先向下退让出清晰空间
-                    y += dirY * factor * factor * 34.0 * evadeStrength;
-                }
+                const double sigmaX = 92.0;
+                const double sigmaY = 84.0;
+                double gaussX = Math.Exp(-(dx * dx) / (2.0 * sigmaX * sigmaX));
+                double gaussY = Math.Exp(-(dy * dy) / (2.0 * sigmaY * sigmaY));
+                double smoothDirY = Math.Tanh((dy + 18.0) / 44.0);
+                y += smoothDirY * gaussX * gaussY * maxPush * evadeStrength;
             }
 
-            pts[i] = new Point(x, Math.Clamp(y, 4, 212));
+            // 软边界渐近压缩，避免波峰贴近顶底边界时被硬截断成平直线
+            if (y < 14.0)
+            {
+                y = 14.0 - 10.0 * Math.Tanh((14.0 - y) / 18.0);
+            }
+            else if (y > 202.0)
+            {
+                y = 202.0 + 8.0 * Math.Tanh((y - 202.0) / 18.0);
+            }
+
+            pts[i] = new Point(x, y);
         }
     }
 
     private void UpdateAlbumContourGlow()
     {
         // 平滑过渡专辑封面提取的主色
-        _curCoverLeft = LerpColor(_curCoverLeft, _targetCoverLeft, 0.10);
-        _curCoverCenter = LerpColor(_curCoverCenter, _targetCoverCenter, 0.10);
-        _curCoverRight = LerpColor(_curCoverRight, _targetCoverRight, 0.10);
+        _curCoverLeft = LerpColor(_curCoverLeft, _targetCoverLeft, 0.14);
+        _curCoverCenter = LerpColor(_curCoverCenter, _targetCoverCenter, 0.14);
+        _curCoverRight = LerpColor(_curCoverRight, _targetCoverRight, 0.14);
         UpdateContourGradientColors();
 
-        _auroraPhase1 += 0.022 + _smoothMaster * 0.045;
+        // 律动强度：0 => 完全静态光；1.0 (100%) => 清晰可见的呼吸与节拍律动；5.0 (500%) => 强烈动感冲击
+        double react = _contourReactivity;
+        double beat = Math.Max(0, _smoothMaster - _slowMaster * 0.78);
+        double energy = _smoothMaster * 0.65 + beat * 1.65;
+
+        if (react > 0.001)
+        {
+            _auroraPhase1 += 0.022 + energy * 0.065 * Math.Min(react, 3.5);
+        }
 
         // 鼠标避让反馈：底部向内打入的光束遇到鼠标时向反方向轻柔偏转并收缩投射深度
         double viewW = ActualWidth > 10 ? ActualWidth : 560.0;
@@ -1412,24 +1594,30 @@ public sealed class MediaDeckView : UserControl, IMorphView
         double bottomProximity = Math.Max(0, (normMy - 0.35) / 0.65) * (1.0 - Math.Min(1.0, Math.Abs(normMx - 0.5) * 1.8));
         double evadeYCompress = bottomProximity * 0.16 * _cursorSmoothOpacity;
 
-        // 克制的向内投射幅度波动（轻打扰设计，还原图3底部向中心打入的柔和光束）
-        double driftX = Math.Sin(_auroraPhase1) * 0.035;
-        double centerX = Math.Clamp(0.50 + driftX + evadeX, 0.24, 0.76);
-        double radiusY = Math.Clamp(0.58 + _smoothMaster * 0.18 - evadeYCompress, 0.38, 0.80);
-        double radiusX = Math.Clamp(0.60 + (_smoothLeft + _smoothRight) * 0.06, 0.52, 0.74);
+        // 向内投射幅度：0 时为纯静态光，100–500% 随音频能量与瞬态节拍显著起伏
+        double driftX = react > 0.001 ? Math.Sin(_auroraPhase1) * Math.Min(0.11, 0.035 * react) : 0.0;
+        double centerX = Math.Clamp(0.50 + driftX + evadeX, 0.18, 0.82);
+
+        double baseY = react > 0.001 ? Math.Max(0.42, 0.56 - Math.Min(0.14, react * 0.03)) : 0.58;
+        double radiusY = Math.Clamp(baseY + energy * 0.24 * react - evadeYCompress, 0.34, 1.18);
+        double radiusX = Math.Clamp(0.58 + (_smoothLeft + _smoothRight) * 0.10 * react, 0.48, 1.08);
 
         _inwardCenterBeamBrush.Center = new Point(centerX, 1.06);
         _inwardCenterBeamBrush.GradientOrigin = new Point(centerX, 1.04);
         _inwardCenterBeamBrush.RadiusX = radiusX;
         _inwardCenterBeamBrush.RadiusY = radiusY;
-        _inwardCenterBeamHost.Opacity = Math.Clamp(0.68 + _smoothMaster * 0.22, 0.55, 0.92);
+        _inwardCenterBeamHost.Opacity = react > 0.001
+            ? Math.Clamp(0.56 + energy * 0.28 * react, 0.45, 1.0)
+            : 0.72;
 
-        double accentX = Math.Clamp(0.48 - driftX * 1.2 + evadeX * 1.15, 0.22, 0.78);
+        double accentX = Math.Clamp(0.48 - driftX * 1.25 + evadeX * 1.15, 0.16, 0.84);
         _inwardAccentBeamBrush.Center = new Point(accentX, 1.08);
         _inwardAccentBeamBrush.GradientOrigin = new Point(accentX, 1.05);
-        _inwardAccentBeamBrush.RadiusX = Math.Clamp(0.48 + _smoothLeft * 0.10, 0.42, 0.62);
-        _inwardAccentBeamBrush.RadiusY = Math.Clamp(0.42 + _smoothRight * 0.14 - evadeYCompress * 0.8, 0.28, 0.60);
-        _inwardAccentBeamHost.Opacity = Math.Clamp(0.54 + (_smoothLeft + _smoothRight) * 0.14, 0.42, 0.82);
+        _inwardAccentBeamBrush.RadiusX = Math.Clamp(0.46 + _smoothLeft * 0.15 * react, 0.40, 0.96);
+        _inwardAccentBeamBrush.RadiusY = Math.Clamp(0.40 + (_smoothRight * 0.18 + beat * 0.32) * react - evadeYCompress * 0.8, 0.26, 1.05);
+        _inwardAccentBeamHost.Opacity = react > 0.001
+            ? Math.Clamp(0.44 + (_smoothLeft + _smoothRight + beat) * 0.18 * react, 0.36, 0.98)
+            : 0.58;
     }
 
     private void UpdateContourGradientColors()
@@ -1549,7 +1737,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         MasterVolumeStepRequested?.Invoke(step);
     }
 
-    // ==================== 卡片内音频输出下拉菜单 ====================
+    // ==================== 卡片内音频输出下拉菜单 + 分实例定时暂停弹出菜单 ====================
 
     private void ToggleDeviceDropdown()
     {
@@ -1559,6 +1747,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             return;
         }
 
+        CloseAlarmPopup();
         HideHint();
         RebuildDeviceDropdownItems();
         _dropdownOpen = true;
@@ -1574,6 +1763,100 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _deviceDropdown.Opacity = 0;
         _deviceDropdown.Height = 0;
         _deviceDropdown.IsHitTestVisible = false;
+    }
+
+    private void ToggleAlarmPopup()
+    {
+        if (_alarmPopupOpen)
+        {
+            CloseAlarmPopup();
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_currentInstanceId)) return;
+
+        CloseDeviceDropdown();
+        HideHint();
+        RebuildAlarmPopupItems();
+        _alarmPopupOpen = true;
+        _alarmPopup.Height = double.NaN;
+        _alarmPopup.Opacity = 1;
+        _alarmPopup.IsHitTestVisible = true;
+    }
+
+    private void CloseAlarmPopup()
+    {
+        if (!_alarmPopupOpen) return;
+        _alarmPopupOpen = false;
+        _alarmPopup.Opacity = 0;
+        _alarmPopup.Height = 0;
+        _alarmPopup.IsHitTestVisible = false;
+    }
+
+    private void RebuildAlarmPopupItems()
+    {
+        _alarmPopupList.Children.Clear();
+        _alarmPopupList.Children.Add(new TextBlock
+        {
+            Text = "定时暂停当前实例",
+            FontSize = 10.5,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = _mutedBrush,
+            Margin = new Thickness(6, 2, 6, 4),
+        });
+
+        var options = new (string Label, int Minutes)[]
+        {
+            ("关闭定时", 0),
+            ("15 分钟后", 15),
+            ("30 分钟后", 30),
+            ("45 分钟后", 45),
+            ("60 分钟后", 60),
+        };
+
+        foreach (var (label, mins) in options)
+        {
+            int m = mins;
+            bool isCancelRow = m == 0;
+            var rowText = new TextBlock
+            {
+                Text = isCancelRow && _currentHasTimer ? $"关闭定时（剩 {FormatTime(_currentTimerRemaining)}）" : label,
+                FontSize = 11.5,
+                Foreground = isCancelRow && _currentHasTimer ? _accentCyanBrush : _textBrush,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            var itemBtn = new Button
+            {
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Padding = new Thickness(8, 4, 8, 4),
+                Background = new SolidColorBrush(Colors.Transparent),
+                BorderBrush = new SolidColorBrush(Colors.Transparent),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7),
+                Content = rowText,
+            };
+            itemBtn.PointerEntered += (_, _) =>
+            {
+                itemBtn.Background = _hoverFillBrush;
+                itemBtn.BorderBrush = _hoverBorderBrush;
+            };
+            itemBtn.PointerExited += (_, _) =>
+            {
+                itemBtn.Background = new SolidColorBrush(Colors.Transparent);
+                itemBtn.BorderBrush = new SolidColorBrush(Colors.Transparent);
+            };
+            itemBtn.Tapped += (_, e) => e.Handled = true;
+            itemBtn.Click += (_, _) =>
+            {
+                if (!string.IsNullOrWhiteSpace(_currentInstanceId))
+                {
+                    SetSleepTimerRequested?.Invoke(_currentInstanceId, m);
+                }
+                CloseAlarmPopup();
+            };
+            _alarmPopupList.Children.Add(itemBtn);
+        }
     }
 
     private void RebuildDeviceDropdownItems()
@@ -1711,30 +1994,87 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     private void AttachCursorHint(UIElement target, Func<string> textProvider)
     {
-        target.PointerEntered += (_, e) => UpdateCursorHint(textProvider(), e);
-        target.PointerMoved += (_, e) => UpdateCursorHint(textProvider(), e);
-        target.PointerExited += (_, _) => HideHint();
+        target.PointerEntered += (_, e) => ScheduleCursorHint(target, textProvider, e);
+        target.PointerMoved += (_, e) =>
+        {
+            if (ReferenceEquals(_hintTarget, target) && !_hintVisible)
+            {
+                _hintPendingPt = e.GetCurrentPoint(_hintCanvas).Position;
+            }
+        };
+        target.PointerExited += (_, _) =>
+        {
+            if (ReferenceEquals(_hintTarget, target))
+            {
+                _hintTarget = null;
+                _hintTextProvider = null;
+                _hintDelayTimer?.Stop();
+                HideHint();
+            }
+        };
     }
 
-    private void UpdateCursorHint(string text, PointerRoutedEventArgs e)
+    private void ScheduleCursorHint(UIElement target, Func<string> textProvider, PointerRoutedEventArgs e)
     {
-        if (_progress < 0.7 || _dropdownOpen)
+        if (_progress < 0.7 || _dropdownOpen || _alarmPopupOpen)
         {
             HideHint();
             return;
         }
 
-        _hintText.Text = text;
-        var pt = e.GetCurrentPoint(_hintCanvas).Position;
+        _hintTarget = target;
+        _hintTextProvider = textProvider;
+        _hintPendingPt = e.GetCurrentPoint(_hintCanvas).Position;
+        HideHint();
 
-        double maxX = Math.Max(4, _hintCanvas.ActualWidth - 130);
-        double maxY = Math.Max(4, _hintCanvas.ActualHeight - 26);
-        Canvas.SetLeft(_hintPill, Math.Clamp(pt.X, 4, maxX));
-        Canvas.SetTop(_hintPill, Math.Clamp(pt.Y, 4, maxY));
-        _hintPill.Opacity = 1;
+        if (_hintDelayTimer is not null)
+        {
+            _hintDelayTimer.Stop();
+            _hintDelayTimer.Start();
+        }
     }
 
-    private void HideHint() => _hintPill.Opacity = 0;
+    private void OnHintDelayElapsed()
+    {
+        if (_hintTarget is null || _hintTextProvider is null || _progress < 0.7 || _dropdownOpen || _alarmPopupOpen)
+        {
+            HideHint();
+            return;
+        }
+
+        _hintText.Text = _hintTextProvider();
+        _hintPill.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+
+        double pillW = _hintPill.DesiredSize.Width > 0 ? _hintPill.DesiredSize.Width : 100;
+        double pillH = _hintPill.DesiredSize.Height > 0 ? _hintPill.DesiredSize.Height : 24;
+        double canvasW = _hintCanvas.ActualWidth > 10 ? _hintCanvas.ActualWidth : 528;
+        double canvasH = _hintCanvas.ActualHeight > 10 ? _hintCanvas.ActualHeight : 188;
+
+        // 统一轻量偏移：(+7, +11)，延迟 1000ms 后固定显示，鼠标离开按钮才隐藏
+        double x = _hintPendingPt.X + 7;
+        double y = _hintPendingPt.Y + 11;
+
+        if (x + pillW > canvasW - 6)
+        {
+            x = Math.Max(6, canvasW - pillW - 6);
+        }
+        if (y + pillH > canvasH - 6)
+        {
+            y = Math.Max(6, _hintPendingPt.Y - pillH - 8);
+        }
+
+        Canvas.SetLeft(_hintPill, Math.Clamp(x, 6, Math.Max(6, canvasW - pillW - 6)));
+        Canvas.SetTop(_hintPill, Math.Clamp(y, 6, Math.Max(6, canvasH - pillH - 6)));
+        _hintPill.Opacity = 1;
+        _hintVisible = true;
+    }
+
+    private void HideHint()
+    {
+        _hintDelayTimer?.Stop();
+        _hintPill.Opacity = 0;
+        _hintVisible = false;
+    }
 
     // ==================== 多实例、翻页动画、进度条拖动与手势 ====================
 
@@ -1871,7 +2211,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     private void OnCardPointerWheelChanged(object sender, PointerRoutedEventArgs e)
     {
-        if (_progress < 0.5 || _dropdownOpen || _isSeeking) return;
+        if (_progress < 0.5 || _dropdownOpen || _alarmPopupOpen || _isSeeking) return;
 
         // 若鼠标当前悬停在喇叭图标或音量条弹出状态，滚轮行为切换为步进 2 修改音量
         if (_isHoveringVolBtn || _isHoveringVolPopup || _volPopupProgress > 0.15)
@@ -1891,7 +2231,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     private void OnCardPointerPressed(object sender, PointerRoutedEventArgs e)
     {
-        if (_progress < 0.5 || _dropdownOpen || _isSeeking || _isDraggingVolBar) return;
+        if (_progress < 0.5 || _dropdownOpen || _alarmPopupOpen || _isSeeking || _isDraggingVolBar) return;
         var pt = e.GetCurrentPoint(this);
         if (!pt.Properties.IsLeftButtonPressed) return;
 
@@ -1902,6 +2242,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     private void OnRootPointerEntered(object sender, PointerRoutedEventArgs e)
     {
+        EnsureAuroraTimerRunning();
         var pos = e.GetCurrentPoint(this).Position;
         _cursorRawX = pos.X;
         _cursorRawY = pos.Y;
@@ -1948,9 +2289,10 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     private void OnCardTapped(object sender, TappedRoutedEventArgs e)
     {
-        if (_dropdownOpen)
+        if (_dropdownOpen || _alarmPopupOpen)
         {
             CloseDeviceDropdown();
+            CloseAlarmPopup();
             e.Handled = true;
             return;
         }
@@ -1963,6 +2305,31 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     // ==================== 图像加载与专辑封面色彩提取 ====================
 
+    private async void UpdateCompactCoverImage(byte[]? bytes)
+    {
+        if (ReferenceEquals(bytes, _lastCompactCoverBytes)) return;
+        _lastCompactCoverBytes = bytes;
+
+        if (bytes is null || bytes.Length == 0)
+        {
+            _compactCoverImg.Source = null;
+            _compactCoverFallback.Opacity = 1;
+            return;
+        }
+
+        try
+        {
+            var bmp = await BytesToBitmapAsync(bytes);
+            if (!ReferenceEquals(bytes, _lastCompactCoverBytes)) return;
+            _compactCoverImg.Source = bmp;
+            _compactCoverFallback.Opacity = 0;
+        }
+        catch
+        {
+            _compactCoverFallback.Opacity = 1;
+        }
+    }
+
     private async void UpdateCoverImage(byte[]? bytes)
     {
         if (ReferenceEquals(bytes, _lastCoverBytes)) return;
@@ -1971,9 +2338,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         if (bytes is null || bytes.Length == 0)
         {
             _coverImg.Source = null;
-            _compactCoverImg.Source = null;
             _coverFallback.Opacity = 1;
-            _compactCoverFallback.Opacity = 1;
             _targetCoverLeft = Color.FromArgb(255, 56, 189, 248);
             _targetCoverCenter = Color.FromArgb(255, 168, 85, 247);
             _targetCoverRight = Color.FromArgb(255, 236, 72, 153);
@@ -1985,9 +2350,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             var bmp = await BytesToBitmapAsync(bytes);
             if (!ReferenceEquals(bytes, _lastCoverBytes)) return;
             _coverImg.Source = bmp;
-            _compactCoverImg.Source = bmp;
             _coverFallback.Opacity = 0;
-            _compactCoverFallback.Opacity = 0;
 
             var palette = await ExtractCoverPaletteAsync(bytes);
             if (ReferenceEquals(bytes, _lastCoverBytes))
@@ -2000,7 +2363,6 @@ public sealed class MediaDeckView : UserControl, IMorphView
         catch
         {
             _coverFallback.Opacity = 1;
-            _compactCoverFallback.Opacity = 1;
         }
     }
 

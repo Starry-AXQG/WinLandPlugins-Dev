@@ -64,18 +64,32 @@ public sealed class SpotlightMediaCard : UserControl
     private readonly GradientStop _wave3TopStop;
     private readonly GradientStop _wave3MidStop;
 
-    // 视觉特效 2：底部向内轮廓光
+    // 视觉特效 2：底部向内轮廓光（支持切歌重新染色动画）
+    private enum ContourDyeOrigin { BottomUp, FromPrevButton, FromNextButton }
+
     private readonly Grid _contourGlowLayer;
     private readonly Border _inwardCenterBeamHost;
     private readonly Border _inwardAccentBeamHost;
-    private readonly RadialGradientBrush _inwardCenterBeamBrush;
-    private readonly RadialGradientBrush _inwardAccentBeamBrush;
-    private readonly GradientStop _beamCoreStop;
-    private readonly GradientStop _beamMidStop;
-    private readonly GradientStop _beamEdgeStop;
-    private readonly GradientStop _accentCoreStop;
-    private readonly GradientStop _accentMidStop;
-    private readonly GradientStop _accentEdgeStop;
+    private readonly Border _dyeOverlayHost;
+    private RadialGradientBrush _inwardCenterBeamBrush;
+    private RadialGradientBrush _inwardAccentBeamBrush;
+    private Color _lastRenderedLeft;
+    private Color _lastRenderedCenter;
+    private Color _lastRenderedRight;
+    private bool _lastRenderedLight;
+
+    // 切歌重新染色动画状态（< 1s）
+    private bool _dyeActive;
+    private DateTimeOffset _dyeStart;
+    private ContourDyeOrigin _dyeOrigin = ContourDyeOrigin.BottomUp;
+    private Point _dyeOriginNorm = new(0.50, 1.06);
+    private Color _dyeFromLeft = Color.FromArgb(255, 56, 189, 248);
+    private Color _dyeFromCenter = Color.FromArgb(255, 168, 85, 247);
+    private Color _dyeFromRight = Color.FromArgb(255, 236, 72, 153);
+    private ContourDyeOrigin? _pendingDyeOrigin;
+    private DateTimeOffset _pendingDyeSetAt = DateTimeOffset.MinValue;
+    private string _lastTrackKey = "";
+    private int _coverLoadVer;
 
     // 鼠标跟随圆形光效
     private readonly Canvas _cursorGlowCanvas;
@@ -122,6 +136,8 @@ public sealed class SpotlightMediaCard : UserControl
     private readonly TextBlock _lyricPrev;
     private readonly TextBlock _lyricCurr;
     private readonly TextBlock _lyricNext;
+    private readonly Button _prevBtn;
+    private readonly Button _nextBtn;
     private readonly FontIcon _playPauseGlyph;
 
     // 左对齐闹钟 + 弹出菜单
@@ -211,51 +227,31 @@ public sealed class SpotlightMediaCard : UserControl
             Children = { _waveRibbon1, _waveRibbon2, _waveRibbon3 },
         };
 
-        // ==================== 0B. 底部向内渐变轮廓光 ====================
-        _beamCoreStop = new GradientStop { Offset = 0.0 };
-        _beamMidStop = new GradientStop { Offset = 0.48 };
-        _beamEdgeStop = new GradientStop { Offset = 1.0 };
-        _inwardCenterBeamBrush = new RadialGradientBrush
-        {
-            Center = new Point(0.50, 1.06),
-            GradientOrigin = new Point(0.50, 1.04),
-            RadiusX = 0.64,
-            RadiusY = 0.68,
-        };
-        _inwardCenterBeamBrush.GradientStops.Add(_beamCoreStop);
-        _inwardCenterBeamBrush.GradientStops.Add(_beamMidStop);
-        _inwardCenterBeamBrush.GradientStops.Add(_beamEdgeStop);
-
-        _accentCoreStop = new GradientStop { Offset = 0.0 };
-        _accentMidStop = new GradientStop { Offset = 0.45 };
-        _accentEdgeStop = new GradientStop { Offset = 1.0 };
-        _inwardAccentBeamBrush = new RadialGradientBrush
-        {
-            Center = new Point(0.46, 1.08),
-            GradientOrigin = new Point(0.46, 1.05),
-            RadiusX = 0.52,
-            RadiusY = 0.48,
-        };
-        _inwardAccentBeamBrush.GradientStops.Add(_accentCoreStop);
-        _inwardAccentBeamBrush.GradientStops.Add(_accentMidStop);
-        _inwardAccentBeamBrush.GradientStops.Add(_accentEdgeStop);
+        // ==================== 0B. 底部向内渐变轮廓光（支持切歌重新染色动画） ====================
+        _inwardCenterBeamBrush = new RadialGradientBrush();
+        _inwardAccentBeamBrush = new RadialGradientBrush();
 
         _inwardCenterBeamHost = new Border
         {
             IsHitTestVisible = false,
-            Background = _inwardCenterBeamBrush,
+            Opacity = 0.85,
         };
         _inwardAccentBeamHost = new Border
         {
             IsHitTestVisible = false,
-            Background = _inwardAccentBeamBrush,
+            Opacity = 0.72,
+        };
+        _dyeOverlayHost = new Border
+        {
+            IsHitTestVisible = false,
+            Opacity = 0,
         };
 
         _contourGlowLayer = new Grid
         {
             IsHitTestVisible = false,
             Opacity = 0,
-            Children = { _inwardCenterBeamHost, _inwardAccentBeamHost },
+            Children = { _inwardCenterBeamHost, _inwardAccentBeamHost, _dyeOverlayHost },
         };
 
         // ==================== 0C. 鼠标中心圆形光效 ====================
@@ -466,18 +462,28 @@ public sealed class SpotlightMediaCard : UserControl
             Child = _alarmInlineText,
         };
 
-        var prevBtn = CreateIconButton(new FontIcon { Glyph = "\uE892", FontSize = 14, Foreground = _textBrush }, 34, 34, 17, false);
-        prevBtn.Click += (_, _) => PreviousRequested?.Invoke(_instanceId);
-        _attachHint(prevBtn, () => "上一曲");
+        _prevBtn = CreateIconButton(new FontIcon { Glyph = "\uE892", FontSize = 14, Foreground = _textBrush }, 34, 34, 17, false);
+        _prevBtn.Click += (_, _) =>
+        {
+            _pendingDyeOrigin = ContourDyeOrigin.FromPrevButton;
+            _pendingDyeSetAt = DateTimeOffset.UtcNow;
+            PreviousRequested?.Invoke(_instanceId);
+        };
+        _attachHint(_prevBtn, () => "上一曲");
 
         _playPauseGlyph = new FontIcon { Glyph = "\uE768", FontSize = 16, Foreground = _textBrush };
         var playBtn = CreateIconButton(_playPauseGlyph, 38, 38, 19, true);
         playBtn.Click += (_, _) => PlayPauseRequested?.Invoke(_instanceId);
         _attachHint(playBtn, () => _isPlaying ? "暂停" : "播放");
 
-        var nextBtn = CreateIconButton(new FontIcon { Glyph = "\uE893", FontSize = 14, Foreground = _textBrush }, 34, 34, 17, false);
-        nextBtn.Click += (_, _) => NextRequested?.Invoke(_instanceId);
-        _attachHint(nextBtn, () => "下一曲");
+        _nextBtn = CreateIconButton(new FontIcon { Glyph = "\uE893", FontSize = 14, Foreground = _textBrush }, 34, 34, 17, false);
+        _nextBtn.Click += (_, _) =>
+        {
+            _pendingDyeOrigin = ContourDyeOrigin.FromNextButton;
+            _pendingDyeSetAt = DateTimeOffset.UtcNow;
+            NextRequested?.Invoke(_instanceId);
+        };
+        _attachHint(_nextBtn, () => "下一曲");
 
         var transportCenter = new StackPanel
         {
@@ -485,7 +491,7 @@ public sealed class SpotlightMediaCard : UserControl
             Spacing = 18,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
-            Children = { prevBtn, playBtn, nextBtn },
+            Children = { _prevBtn, playBtn, _nextBtn },
         };
 
         var transportRow = new Grid
@@ -719,8 +725,12 @@ public sealed class SpotlightMediaCard : UserControl
             UpdateProgressVisual(ratio);
         }
 
+        string trackKey = $"{info.Title}||{info.Artist}||{info.LocalFilePath}";
+        bool trackChanged = !string.Equals(_lastTrackKey, trackKey, StringComparison.OrdinalIgnoreCase);
+        _lastTrackKey = trackKey;
+
         UpdateTimerDisplay(hasTimer, timerRemaining);
-        UpdateCoverImage(info.ThumbnailBytes);
+        UpdateCoverImage(info.ThumbnailBytes, force: trackChanged);
         UpdateAppIconImage(info.AppIconBytes);
     }
 
@@ -835,12 +845,109 @@ public sealed class SpotlightMediaCard : UserControl
         }
     }
 
+    private void BeginContourPaletteTransition(Color left, Color center, Color right)
+    {
+        bool changed = left != _targetCoverLeft || center != _targetCoverCenter || right != _targetCoverRight;
+        _targetCoverLeft = left;
+        _targetCoverCenter = center;
+        _targetCoverRight = right;
+
+        var origin = ContourDyeOrigin.BottomUp;
+        if (_pendingDyeOrigin.HasValue && (DateTimeOffset.UtcNow - _pendingDyeSetAt).TotalSeconds < 4.5)
+        {
+            origin = _pendingDyeOrigin.Value;
+            _pendingDyeOrigin = null;
+        }
+        else if (!changed && !_dyeActive)
+        {
+            return;
+        }
+
+        _dyeFromLeft = _curCoverLeft;
+        _dyeFromCenter = _curCoverCenter;
+        _dyeFromRight = _curCoverRight;
+        _dyeOrigin = origin;
+        _dyeOriginNorm = ResolveDyeOriginNormalized(origin);
+        _dyeStart = DateTimeOffset.UtcNow;
+        _dyeActive = true;
+    }
+
+    private Point ResolveDyeOriginNormalized(ContourDyeOrigin origin)
+    {
+        if (origin == ContourDyeOrigin.BottomUp)
+        {
+            return new Point(0.50, 1.06);
+        }
+        var btn = origin == ContourDyeOrigin.FromPrevButton ? _prevBtn : _nextBtn;
+        try
+        {
+            double w = _contourGlowLayer.ActualWidth > 10 ? _contourGlowLayer.ActualWidth : 780.0;
+            double h = _contourGlowLayer.ActualHeight > 10 ? _contourGlowLayer.ActualHeight : CardHeight;
+            var pt = btn.TransformToVisual(_contourGlowLayer).TransformPoint(new Point(btn.ActualWidth * 0.5, btn.ActualHeight * 0.5));
+            return new Point(Math.Clamp(pt.X / w, 0.10, 0.90), Math.Clamp(pt.Y / h, 0.15, 0.95));
+        }
+        catch
+        {
+            return origin == ContourDyeOrigin.FromPrevButton ? new Point(0.42, 0.72) : new Point(0.58, 0.72);
+        }
+    }
+
     private void UpdateAlbumContourGlow()
     {
-        _curCoverLeft = LerpColor(_curCoverLeft, _targetCoverLeft, 0.14);
-        _curCoverCenter = LerpColor(_curCoverCenter, _targetCoverCenter, 0.14);
-        _curCoverRight = LerpColor(_curCoverRight, _targetCoverRight, 0.14);
-        UpdateContourGradientColors();
+        if (_dyeActive)
+        {
+            const double dyeDurationMs = 780.0;
+            double t = Math.Clamp((DateTimeOffset.UtcNow - _dyeStart).TotalMilliseconds / dyeDurationMs, 0, 1);
+            double ease = 1.0 - Math.Pow(1.0 - t, 3);
+
+            _curCoverLeft = LerpColor(_dyeFromLeft, _targetCoverLeft, ease);
+            _curCoverCenter = LerpColor(_dyeFromCenter, _targetCoverCenter, ease);
+            _curCoverRight = LerpColor(_dyeFromRight, _targetCoverRight, ease);
+
+            bool light = _theme.IsLight;
+            double waveAlpha = Math.Sin(t * Math.PI);
+            double rx = _dyeOrigin == ContourDyeOrigin.BottomUp ? (0.42 + ease * 0.62) : (0.04 + ease * 1.12);
+            double ry = _dyeOrigin == ContourDyeOrigin.BottomUp ? (0.06 + ease * 1.10) : (0.04 + ease * 1.32);
+
+            var dyeBrush = new RadialGradientBrush
+            {
+                Center = _dyeOriginNorm,
+                GradientOrigin = _dyeOriginNorm,
+                RadiusX = rx,
+                RadiusY = ry,
+            };
+            byte peakA = (byte)Math.Clamp((light ? 175 : 165) * waveAlpha, 0, 220);
+            byte midA = (byte)Math.Clamp((light ? 95 : 88) * waveAlpha, 0, 140);
+            dyeBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_targetCoverCenter, peakA), Offset = 0.0 });
+            dyeBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_targetCoverLeft, midA), Offset = 0.52 });
+            dyeBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_targetCoverRight, 0), Offset = 1.0 });
+
+            _dyeOverlayHost.Background = dyeBrush;
+            _dyeOverlayHost.Opacity = Math.Clamp(waveAlpha * 0.92, 0, 0.95);
+
+            if (t >= 1.0)
+            {
+                _dyeActive = false;
+                _curCoverLeft = _targetCoverLeft;
+                _curCoverCenter = _targetCoverCenter;
+                _curCoverRight = _targetCoverRight;
+                _dyeOverlayHost.Opacity = 0;
+            }
+        }
+        else
+        {
+            _curCoverLeft = LerpColor(_curCoverLeft, _targetCoverLeft, 0.16);
+            _curCoverCenter = LerpColor(_curCoverCenter, _targetCoverCenter, 0.16);
+            _curCoverRight = LerpColor(_curCoverRight, _targetCoverRight, 0.16);
+        }
+
+        if (_curCoverLeft != _lastRenderedLeft ||
+            _curCoverCenter != _lastRenderedCenter ||
+            _curCoverRight != _lastRenderedRight ||
+            _theme.IsLight != _lastRenderedLight)
+        {
+            UpdateContourGradientColors();
+        }
 
         double react = _contourReactivity;
         double beat = Math.Max(0, _smoothMaster - _slowMaster * 0.78);
@@ -891,13 +998,37 @@ public sealed class SpotlightMediaCard : UserControl
         byte coreAlpha = light ? (byte)160 : (byte)150;
         byte midAlpha = light ? (byte)75 : (byte)70;
 
-        _beamCoreStop.Color = WithAlpha(_curCoverCenter, coreAlpha);
-        _beamMidStop.Color = WithAlpha(_curCoverLeft, midAlpha);
-        _beamEdgeStop.Color = WithAlpha(_curCoverLeft, 0);
+        var centerBrush = new RadialGradientBrush
+        {
+            Center = _inwardCenterBeamBrush.Center,
+            GradientOrigin = _inwardCenterBeamBrush.GradientOrigin,
+            RadiusX = _inwardCenterBeamBrush.RadiusX > 0.05 ? _inwardCenterBeamBrush.RadiusX : 0.64,
+            RadiusY = _inwardCenterBeamBrush.RadiusY > 0.05 ? _inwardCenterBeamBrush.RadiusY : 0.68,
+        };
+        centerBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverCenter, coreAlpha), Offset = 0.0 });
+        centerBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverLeft, midAlpha), Offset = 0.48 });
+        centerBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverLeft, 0), Offset = 1.0 });
 
-        _accentCoreStop.Color = WithAlpha(_curCoverRight, (byte)(coreAlpha - 20));
-        _accentMidStop.Color = WithAlpha(_curCoverCenter, (byte)(midAlpha - 15));
-        _accentEdgeStop.Color = WithAlpha(_curCoverCenter, 0);
+        var accentBrush = new RadialGradientBrush
+        {
+            Center = _inwardAccentBeamBrush.Center,
+            GradientOrigin = _inwardAccentBeamBrush.GradientOrigin,
+            RadiusX = _inwardAccentBeamBrush.RadiusX > 0.05 ? _inwardAccentBeamBrush.RadiusX : 0.52,
+            RadiusY = _inwardAccentBeamBrush.RadiusY > 0.05 ? _inwardAccentBeamBrush.RadiusY : 0.48,
+        };
+        accentBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverRight, (byte)(coreAlpha - 20)), Offset = 0.0 });
+        accentBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverCenter, (byte)(midAlpha - 15)), Offset = 0.45 });
+        accentBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverCenter, 0), Offset = 1.0 });
+
+        _inwardCenterBeamBrush = centerBrush;
+        _inwardAccentBeamBrush = accentBrush;
+        _inwardCenterBeamHost.Background = centerBrush;
+        _inwardAccentBeamHost.Background = accentBrush;
+
+        _lastRenderedLeft = _curCoverLeft;
+        _lastRenderedCenter = _curCoverCenter;
+        _lastRenderedRight = _curCoverRight;
+        _lastRenderedLight = light;
     }
 
     private void ToggleAlarmPopup()
@@ -1037,34 +1168,40 @@ public sealed class SpotlightMediaCard : UserControl
         UpdateProgressVisual(_lastRatio);
     }
 
-    private async void UpdateCoverImage(byte[]? bytes)
+    private async void UpdateCoverImage(byte[]? bytes, bool force = false)
     {
-        if (ReferenceEquals(bytes, _lastCoverBytes)) return;
+        if (!force && ReferenceEquals(bytes, _lastCoverBytes)) return;
         _lastCoverBytes = bytes;
+        int ver = ++_coverLoadVer;
+
         if (bytes is null || bytes.Length == 0)
         {
             _coverImg.Source = null;
             _coverFallback.Opacity = 1;
-            _targetCoverLeft = Color.FromArgb(255, 56, 189, 248);
-            _targetCoverCenter = Color.FromArgb(255, 168, 85, 247);
-            _targetCoverRight = Color.FromArgb(255, 236, 72, 153);
+            BeginContourPaletteTransition(
+                Color.FromArgb(255, 56, 189, 248),
+                Color.FromArgb(255, 168, 85, 247),
+                Color.FromArgb(255, 236, 72, 153));
             return;
         }
         try
         {
             var bmp = await BytesToBitmapAsync(bytes);
-            if (!ReferenceEquals(bytes, _lastCoverBytes)) return;
+            if (ver != _coverLoadVer) return;
             _coverImg.Source = bmp;
             _coverFallback.Opacity = 0;
             var palette = await ExtractCoverPaletteAsync(bytes);
-            if (ReferenceEquals(bytes, _lastCoverBytes))
+            if (ver == _coverLoadVer)
             {
-                _targetCoverLeft = palette.Left;
-                _targetCoverCenter = palette.Center;
-                _targetCoverRight = palette.Right;
+                BeginContourPaletteTransition(palette.Left, palette.Center, palette.Right);
             }
         }
-        catch { _coverFallback.Opacity = 1; }
+        catch
+        {
+            if (ver != _coverLoadVer) return;
+            _coverImg.Source = null;
+            _coverFallback.Opacity = 1;
+        }
     }
 
     private async void UpdateAppIconImage(byte[]? bytes)

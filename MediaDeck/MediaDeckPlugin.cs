@@ -101,6 +101,7 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         _view.SwitchOutputDeviceRequested += deviceId => _audioService.SwitchOutputDeviceAsync(deviceId);
         _view.MasterVolumeChangedRequested += pct => _audioService.SetMasterVolume(pct);
         _view.MasterVolumeStepRequested += delta => _audioService.StepMasterVolume(delta);
+        _view.MasterMuteToggleRequested += () => _audioService.ToggleMasterMute();
         _view.SetSleepTimerRequested += HandleSetInstanceSleepTimer;
 
         // 服务事件监听

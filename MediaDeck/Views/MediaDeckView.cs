@@ -79,18 +79,32 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private readonly GradientStop _wave3TopStop;
     private readonly GradientStop _wave3MidStop;
 
-    // ==================== 视觉特效层 2：图3同款底部向容器中心投射的渐变光线（克制呼吸 + 鼠标避让） ====================
+    // ==================== 视觉特效层 2：图3同款底部向容器中心投射的渐变光线（支持切歌重新染色动画 + 鼠标避让） ====================
+    private enum ContourDyeOrigin { BottomUp, FromPrevButton, FromNextButton }
+
     private readonly Grid _contourGlowLayer;
     private readonly Border _inwardCenterBeamHost;
     private readonly Border _inwardAccentBeamHost;
-    private readonly RadialGradientBrush _inwardCenterBeamBrush;
-    private readonly RadialGradientBrush _inwardAccentBeamBrush;
-    private readonly GradientStop _beamCoreStop;
-    private readonly GradientStop _beamMidStop;
-    private readonly GradientStop _beamEdgeStop;
-    private readonly GradientStop _accentCoreStop;
-    private readonly GradientStop _accentMidStop;
-    private readonly GradientStop _accentEdgeStop;
+    private readonly Border _dyeOverlayHost;
+    private RadialGradientBrush _inwardCenterBeamBrush;
+    private RadialGradientBrush _inwardAccentBeamBrush;
+    private Color _lastRenderedLeft;
+    private Color _lastRenderedCenter;
+    private Color _lastRenderedRight;
+    private bool _lastRenderedLight;
+
+    // 轮廓光重新染色过渡动画状态（时长 < 1s）
+    private bool _dyeActive;
+    private DateTimeOffset _dyeStart;
+    private ContourDyeOrigin _dyeOrigin = ContourDyeOrigin.BottomUp;
+    private Point _dyeOriginNorm = new(0.50, 1.06);
+    private Color _dyeFromLeft = Color.FromArgb(255, 56, 189, 248);
+    private Color _dyeFromCenter = Color.FromArgb(255, 168, 85, 247);
+    private Color _dyeFromRight = Color.FromArgb(255, 236, 72, 153);
+    private ContourDyeOrigin? _pendingDyeOrigin;
+    private DateTimeOffset _pendingDyeSetAt = DateTimeOffset.MinValue;
+    private string _lastTrackKey = "";
+    private string _lastCompactTrackKey = "";
 
     // ==================== 全局鼠标中心圆形光效 + 避让物理场 ====================
     private readonly Canvas _cursorGlowCanvas;
@@ -193,6 +207,8 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private bool _currentHasTimer;
     private TimeSpan _currentTimerRemaining;
 
+    private readonly Button _prevBtn;
+    private readonly Button _nextBtn;
     private readonly FontIcon _playPauseGlyph;
     private readonly Button _volumeBtn;
     private readonly FontIcon _volumeBtnGlyph;
@@ -207,6 +223,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private DateTimeOffset _volHoverLeaveTime = DateTimeOffset.MinValue;
     private double _volPopupProgress; // 0 = 收起, 1 = 完全展开
     private int _currentVolumePct = 50;
+    private bool _currentMasterMuted;
 
     // ==================== 展开态最底行进度条 ====================
     private readonly Grid _progressHitArea;
@@ -259,6 +276,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
     public event Action<string>? SwitchOutputDeviceRequested;
     public event Action<int>? MasterVolumeChangedRequested;
     public event Action<int>? MasterVolumeStepRequested;
+    public event Action? MasterMuteToggleRequested;
     public event Action<string, int>? SetSleepTimerRequested;
 
     public MediaDeckView(
@@ -306,48 +324,28 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Children = { _waveRibbon1, _waveRibbon2, _waveRibbon3 },
         };
 
-        // ==================== 0B. 图3同款：底部向容器中心打入的柔和渐变光线（自下而上渐变，随音频克制波动） ====================
-        _beamCoreStop = new GradientStop { Offset = 0.0 };
-        _beamMidStop = new GradientStop { Offset = 0.48 };
-        _beamEdgeStop = new GradientStop { Offset = 1.0 };
-        _inwardCenterBeamBrush = new RadialGradientBrush
-        {
-            Center = new Point(0.50, 1.06),
-            GradientOrigin = new Point(0.50, 1.04),
-            RadiusX = 0.64,
-            RadiusY = 0.68,
-        };
-        _inwardCenterBeamBrush.GradientStops.Add(_beamCoreStop);
-        _inwardCenterBeamBrush.GradientStops.Add(_beamMidStop);
-        _inwardCenterBeamBrush.GradientStops.Add(_beamEdgeStop);
-
-        _accentCoreStop = new GradientStop { Offset = 0.0 };
-        _accentMidStop = new GradientStop { Offset = 0.50 };
-        _accentEdgeStop = new GradientStop { Offset = 1.0 };
-        _inwardAccentBeamBrush = new RadialGradientBrush
-        {
-            Center = new Point(0.46, 1.08),
-            GradientOrigin = new Point(0.46, 1.05),
-            RadiusX = 0.52,
-            RadiusY = 0.48,
-        };
-        _inwardAccentBeamBrush.GradientStops.Add(_accentCoreStop);
-        _inwardAccentBeamBrush.GradientStops.Add(_accentMidStop);
-        _inwardAccentBeamBrush.GradientStops.Add(_accentEdgeStop);
+        // ==================== 0B. 图3同款：底部向容器中心打入的柔和渐变光线（支持切歌重新染色动画） ====================
+        _inwardCenterBeamBrush = new RadialGradientBrush();
+        _inwardAccentBeamBrush = new RadialGradientBrush();
 
         _inwardCenterBeamHost = new Border
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
-            Background = _inwardCenterBeamBrush,
             Opacity = 0.85,
         };
         _inwardAccentBeamHost = new Border
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
-            Background = _inwardAccentBeamBrush,
             Opacity = 0.72,
+        };
+        _dyeOverlayHost = new Border
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch,
+            Opacity = 0,
+            IsHitTestVisible = false,
         };
 
         _contourGlowLayer = new Grid
@@ -358,6 +356,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             {
                 _inwardCenterBeamHost,
                 _inwardAccentBeamHost,
+                _dyeOverlayHost,
             },
         };
 
@@ -678,11 +677,16 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _middleGrid.Children.Add(middleRight);
 
         // 2.6 播放控制行：居中播放控制 + 最右侧对齐喇叭图标（与右上角图标同宽同右边距）
-        var prevBtn = CreateInteractiveIconButton(
+        _prevBtn = CreateInteractiveIconButton(
             new FontIcon { Glyph = "\uE892", FontSize = 15, Foreground = _textBrush },
             36, 36, cornerRadius: 18, isPrimaryPill: false);
-        prevBtn.Click += (_, _) => PreviousRequested?.Invoke();
-        AttachCursorHint(prevBtn, () => "上一曲");
+        _prevBtn.Click += (_, _) =>
+        {
+            _pendingDyeOrigin = ContourDyeOrigin.FromPrevButton;
+            _pendingDyeSetAt = DateTimeOffset.UtcNow;
+            PreviousRequested?.Invoke();
+        };
+        AttachCursorHint(_prevBtn, () => "上一曲");
 
         _playPauseGlyph = new FontIcon { Glyph = "\uE768", FontSize = 17, Foreground = _textBrush };
         var playBtn = CreateInteractiveIconButton(
@@ -691,11 +695,16 @@ public sealed class MediaDeckView : UserControl, IMorphView
         playBtn.Click += (_, _) => PlayPauseRequested?.Invoke();
         AttachCursorHint(playBtn, () => _isPlaying ? "暂停" : "播放");
 
-        var nextBtn = CreateInteractiveIconButton(
+        _nextBtn = CreateInteractiveIconButton(
             new FontIcon { Glyph = "\uE893", FontSize = 15, Foreground = _textBrush },
             36, 36, cornerRadius: 18, isPrimaryPill: false);
-        nextBtn.Click += (_, _) => NextRequested?.Invoke();
-        AttachCursorHint(nextBtn, () => "下一曲");
+        _nextBtn.Click += (_, _) =>
+        {
+            _pendingDyeOrigin = ContourDyeOrigin.FromNextButton;
+            _pendingDyeSetAt = DateTimeOffset.UtcNow;
+            NextRequested?.Invoke();
+        };
+        AttachCursorHint(_nextBtn, () => "下一曲");
 
         var transportCenterStack = new StackPanel
         {
@@ -703,7 +712,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Spacing = 18,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
-            Children = { prevBtn, playBtn, nextBtn },
+            Children = { _prevBtn, playBtn, _nextBtn },
         };
 
         // 左对齐闹钟定时暂停按钮（与左上角来源图标同左边距、与右侧喇叭图标对称）
@@ -767,6 +776,13 @@ public sealed class MediaDeckView : UserControl, IMorphView
             _volHoverLeaveTime = DateTimeOffset.UtcNow;
         };
         _volumeBtn.PointerWheelChanged += OnVolumePointerWheelChanged;
+        _volumeBtn.Click += (_, _) =>
+        {
+            _currentMasterMuted = !_currentMasterMuted;
+            UpdateVolumeBarVisual(_currentMasterMuted ? 0 : Math.Max(1, _currentVolumePct), _currentMasterMuted);
+            MasterMuteToggleRequested?.Invoke();
+        };
+        AttachCursorHint(_volumeBtn, () => _currentMasterMuted ? "取消静音" : "静音音量");
 
         var transportBarGrid = new Grid
         {
@@ -1179,6 +1195,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         if (compact is null)
         {
             _compactIsPlaying = false;
+            _lastCompactTrackKey = "";
             SetCompactText("声枢 · 暂无媒体", isLyric: false);
             UpdateCompactQuietifyStatic();
             UpdateCompactCoverImage(null);
@@ -1189,7 +1206,10 @@ public sealed class MediaDeckView : UserControl, IMorphView
             bool compactHasLyric = compactLyrics.HasSyncedLyrics && !string.IsNullOrWhiteSpace(compactLyrics.Current);
             SetCompactText(compactHasLyric ? compactLyrics.Current : compact.Title, isLyric: compactHasLyric);
             UpdateCompactQuietifyStatic();
-            UpdateCompactCoverImage(compact.ThumbnailBytes);
+            string compactTrackKey = $"{compact.Id}||{compact.Title}||{compact.Artist}";
+            bool compactTrackChanged = !string.Equals(_lastCompactTrackKey, compactTrackKey, StringComparison.OrdinalIgnoreCase);
+            _lastCompactTrackKey = compactTrackKey;
+            UpdateCompactCoverImage(compact.ThumbnailBytes, triggerPaletteIfCompact: compactTrackChanged && _progress < 0.5);
         }
 
         // 2) 展开卡片形态刷新：遵循卡片当前选中的实例
@@ -1218,6 +1238,9 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
         EnsureAuroraTimerRunning();
         bool instanceChanged = !string.Equals(_currentInstanceId, current.Id, StringComparison.OrdinalIgnoreCase);
+        string trackKey = $"{current.Id}||{current.Title}||{current.Artist}";
+        bool trackChanged = !string.Equals(_lastTrackKey, trackKey, StringComparison.OrdinalIgnoreCase);
+        _lastTrackKey = trackKey;
         if (instanceChanged)
         {
             _currentInstanceId = current.Id;
@@ -1249,7 +1272,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _lyricCurr.Text = lyrics.Current;
         _lyricNext.Text = lyrics.Next;
 
-        UpdateCoverImage(current.ThumbnailBytes, force: instanceChanged);
+        UpdateCoverImage(current.ThumbnailBytes, force: instanceChanged || trackChanged);
         UpdateAppIconImage(current.AppIconBytes, force: instanceChanged);
         RebuildInstanceDots(totalCount, selectedIndex);
     }
@@ -1580,15 +1603,127 @@ public sealed class MediaDeckView : UserControl, IMorphView
         }
     }
 
+    private void BeginContourPaletteTransition(Color left, Color center, Color right, bool allowButtonOrigin)
+    {
+        bool colorActuallyChanged = left != _targetCoverLeft || center != _targetCoverCenter || right != _targetCoverRight;
+        _targetCoverLeft = left;
+        _targetCoverCenter = center;
+        _targetCoverRight = right;
+
+        // 决定重新染色扩散起点：用户点击上/下一曲 -> 以对应按钮为中心扩散；否则 -> 自下而上柔和染色
+        var origin = ContourDyeOrigin.BottomUp;
+        if (allowButtonOrigin && _pendingDyeOrigin.HasValue && (DateTimeOffset.UtcNow - _pendingDyeSetAt).TotalSeconds < 4.5)
+        {
+            origin = _pendingDyeOrigin.Value;
+            _pendingDyeOrigin = null;
+        }
+        else if (!colorActuallyChanged && !_dyeActive)
+        {
+            return;
+        }
+
+        _dyeFromLeft = _curCoverLeft;
+        _dyeFromCenter = _curCoverCenter;
+        _dyeFromRight = _curCoverRight;
+        _dyeOrigin = origin;
+        _dyeOriginNorm = ResolveDyeOriginNormalized(origin);
+        _dyeStart = DateTimeOffset.UtcNow;
+        _dyeActive = true;
+    }
+
+    private Point ResolveDyeOriginNormalized(ContourDyeOrigin origin)
+    {
+        if (origin == ContourDyeOrigin.BottomUp || _progress < 0.5)
+        {
+            return new Point(0.50, 1.06);
+        }
+
+        var btn = origin == ContourDyeOrigin.FromPrevButton ? _prevBtn : _nextBtn;
+        try
+        {
+            double w = _contourGlowLayer.ActualWidth > 10 ? _contourGlowLayer.ActualWidth : 560.0;
+            double h = _contourGlowLayer.ActualHeight > 10 ? _contourGlowLayer.ActualHeight : ExpandedHeight;
+            var pt = btn.TransformToVisual(_contourGlowLayer).TransformPoint(new Point(btn.ActualWidth * 0.5, btn.ActualHeight * 0.5));
+            return new Point(Math.Clamp(pt.X / w, 0.10, 0.90), Math.Clamp(pt.Y / h, 0.15, 0.95));
+        }
+        catch
+        {
+            return origin == ContourDyeOrigin.FromPrevButton ? new Point(0.39, 0.72) : new Point(0.61, 0.72);
+        }
+    }
+
     private void UpdateAlbumContourGlow()
     {
-        // 平滑过渡专辑封面提取的主色
-        _curCoverLeft = LerpColor(_curCoverLeft, _targetCoverLeft, 0.14);
-        _curCoverCenter = LerpColor(_curCoverCenter, _targetCoverCenter, 0.14);
-        _curCoverRight = LerpColor(_curCoverRight, _targetCoverRight, 0.14);
-        UpdateContourGradientColors();
+        // 1) 切歌重新染色动画（780ms，< 1s，丝滑三次缓出）：
+        //    - 胶囊 / 自动切歌：自下而上波浪染色
+        //    - 卡片点击上/下一曲：以上/下一曲按钮为中心向外扩散染色
+        if (_dyeActive)
+        {
+            const double dyeDurationMs = 780.0;
+            double t = Math.Clamp((DateTimeOffset.UtcNow - _dyeStart).TotalMilliseconds / dyeDurationMs, 0, 1);
+            double ease = 1.0 - Math.Pow(1.0 - t, 3);
 
-        // 律动强度：0 => 完全静态光；1.0 (100%) => 清晰可见的呼吸与节拍律动；5.0 (500%) => 强烈动感冲击
+            _curCoverLeft = LerpColor(_dyeFromLeft, _targetCoverLeft, ease);
+            _curCoverCenter = LerpColor(_dyeFromCenter, _targetCoverCenter, ease);
+            _curCoverRight = LerpColor(_dyeFromRight, _targetCoverRight, ease);
+
+            // 染色波前覆盖层：新建 RadialGradientBrush 绕过 WinUI 3 GradientStop 不刷新 Bug
+            bool light = _theme.IsLight;
+            double waveAlpha = Math.Sin(t * Math.PI); // 0 -> 1 -> 0 柔和淡入再融入基底光
+            double rx, ry;
+            if (_dyeOrigin == ContourDyeOrigin.BottomUp)
+            {
+                rx = 0.42 + ease * 0.62;
+                ry = 0.06 + ease * 1.10;
+            }
+            else
+            {
+                rx = 0.04 + ease * 1.12;
+                ry = 0.04 + ease * 1.32;
+            }
+
+            var dyeBrush = new RadialGradientBrush
+            {
+                Center = _dyeOriginNorm,
+                GradientOrigin = _dyeOriginNorm,
+                RadiusX = rx,
+                RadiusY = ry,
+            };
+            byte peakA = (byte)Math.Clamp((light ? 175 : 165) * waveAlpha, 0, 220);
+            byte midA = (byte)Math.Clamp((light ? 95 : 88) * waveAlpha, 0, 140);
+            dyeBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_targetCoverCenter, peakA), Offset = 0.0 });
+            dyeBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_targetCoverLeft, midA), Offset = 0.52 });
+            dyeBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_targetCoverRight, 0), Offset = 1.0 });
+
+            _dyeOverlayHost.Background = dyeBrush;
+            _dyeOverlayHost.Opacity = Math.Clamp(waveAlpha * 0.92, 0, 0.95);
+
+            if (t >= 1.0)
+            {
+                _dyeActive = false;
+                _curCoverLeft = _targetCoverLeft;
+                _curCoverCenter = _targetCoverCenter;
+                _curCoverRight = _targetCoverRight;
+                _dyeOverlayHost.Opacity = 0;
+            }
+        }
+        else
+        {
+            _curCoverLeft = LerpColor(_curCoverLeft, _targetCoverLeft, 0.16);
+            _curCoverCenter = LerpColor(_curCoverCenter, _targetCoverCenter, 0.16);
+            _curCoverRight = LerpColor(_curCoverRight, _targetCoverRight, 0.16);
+        }
+
+        // 仅当颜色或主题变化时重建 RadialGradientBrush（彻底解决 WinUI 3 修改 GradientStop.Color 不生效导致一直停留在旧颜色的问题）
+        if (_curCoverLeft != _lastRenderedLeft ||
+            _curCoverCenter != _lastRenderedCenter ||
+            _curCoverRight != _lastRenderedRight ||
+            _theme.IsLight != _lastRenderedLight)
+        {
+            UpdateContourGradientColors();
+        }
+
+        // 2) 律动强度：0 => 完全静态光；1.0 (100%) => 清晰可见的呼吸与节拍律动；5.0 (500%) => 强烈动感冲击
         double react = _contourReactivity;
         double beat = Math.Max(0, _smoothMaster - _slowMaster * 0.78);
         double energy = _smoothMaster * 0.65 + beat * 1.65;
@@ -1608,7 +1743,6 @@ public sealed class MediaDeckView : UserControl, IMorphView
         double bottomProximity = Math.Max(0, (normMy - 0.35) / 0.65) * (1.0 - Math.Min(1.0, Math.Abs(normMx - 0.5) * 1.8));
         double evadeYCompress = bottomProximity * 0.16 * _cursorSmoothOpacity;
 
-        // 向内投射幅度：0 时为纯静态光，100–500% 随音频能量与瞬态节拍显著起伏
         double driftX = react > 0.001 ? Math.Sin(_auroraPhase1) * Math.Min(0.11, 0.035 * react) : 0.0;
         double centerX = Math.Clamp(0.50 + driftX + evadeX, 0.18, 0.82);
 
@@ -1637,17 +1771,41 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private void UpdateContourGradientColors()
     {
         bool light = _theme.IsLight;
-        // 图3质感：底部核心处为专辑封面主色，自下而上向容器中心柔和过渡为封面次色并完全消散为透明（0 alpha），绝无硬边
         byte coreAlpha = light ? (byte)165 : (byte)155;
         byte midAlpha = light ? (byte)78 : (byte)72;
 
-        _beamCoreStop.Color = WithAlpha(_curCoverCenter, coreAlpha);
-        _beamMidStop.Color = WithAlpha(_curCoverLeft, midAlpha);
-        _beamEdgeStop.Color = WithAlpha(_curCoverLeft, 0);
+        // 构造全新 RadialGradientBrush 实例，强制 WinUI 3 Composition 立即应用最新颜色
+        var centerBrush = new RadialGradientBrush
+        {
+            Center = _inwardCenterBeamBrush.Center,
+            GradientOrigin = _inwardCenterBeamBrush.GradientOrigin,
+            RadiusX = _inwardCenterBeamBrush.RadiusX > 0.05 ? _inwardCenterBeamBrush.RadiusX : 0.64,
+            RadiusY = _inwardCenterBeamBrush.RadiusY > 0.05 ? _inwardCenterBeamBrush.RadiusY : 0.68,
+        };
+        centerBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverCenter, coreAlpha), Offset = 0.0 });
+        centerBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverLeft, midAlpha), Offset = 0.48 });
+        centerBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverLeft, 0), Offset = 1.0 });
 
-        _accentCoreStop.Color = WithAlpha(_curCoverRight, (byte)(coreAlpha - 20));
-        _accentMidStop.Color = WithAlpha(_curCoverCenter, (byte)(midAlpha - 15));
-        _accentEdgeStop.Color = WithAlpha(_curCoverCenter, 0);
+        var accentBrush = new RadialGradientBrush
+        {
+            Center = _inwardAccentBeamBrush.Center,
+            GradientOrigin = _inwardAccentBeamBrush.GradientOrigin,
+            RadiusX = _inwardAccentBeamBrush.RadiusX > 0.05 ? _inwardAccentBeamBrush.RadiusX : 0.52,
+            RadiusY = _inwardAccentBeamBrush.RadiusY > 0.05 ? _inwardAccentBeamBrush.RadiusY : 0.48,
+        };
+        accentBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverRight, (byte)(coreAlpha - 20)), Offset = 0.0 });
+        accentBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverCenter, (byte)(midAlpha - 15)), Offset = 0.50 });
+        accentBrush.GradientStops.Add(new GradientStop { Color = WithAlpha(_curCoverCenter, 0), Offset = 1.0 });
+
+        _inwardCenterBeamBrush = centerBrush;
+        _inwardAccentBeamBrush = accentBrush;
+        _inwardCenterBeamHost.Background = centerBrush;
+        _inwardAccentBeamHost.Background = accentBrush;
+
+        _lastRenderedLeft = _curCoverLeft;
+        _lastRenderedCenter = _curCoverCenter;
+        _lastRenderedRight = _curCoverRight;
+        _lastRenderedLight = light;
     }
 
     private static Color WithAlpha(Color c, byte a) => Color.FromArgb(a, c.R, c.G, c.B);
@@ -1663,8 +1821,9 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private void SyncMasterVolumeFromProvider()
     {
         var (vol, muted) = _masterVolumeProvider();
+        _currentMasterMuted = muted;
         int displayVol = muted ? 0 : Math.Clamp(vol, 0, 100);
-        _currentVolumePct = displayVol;
+        if (!muted) _currentVolumePct = displayVol;
         UpdateVolumeBarVisual(displayVol, muted);
     }
 
@@ -2319,9 +2478,9 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
     // ==================== 图像加载与专辑封面色彩提取 ====================
 
-    private async void UpdateCompactCoverImage(byte[]? bytes)
+    private async void UpdateCompactCoverImage(byte[]? bytes, bool triggerPaletteIfCompact = false)
     {
-        if (ReferenceEquals(bytes, _lastCompactCoverBytes)) return;
+        if (!triggerPaletteIfCompact && ReferenceEquals(bytes, _lastCompactCoverBytes)) return;
         _lastCompactCoverBytes = bytes;
         int ver = ++_compactCoverLoadVer;
 
@@ -2329,6 +2488,14 @@ public sealed class MediaDeckView : UserControl, IMorphView
         {
             _compactCoverImg.Source = null;
             _compactCoverFallback.Opacity = 1;
+            if (triggerPaletteIfCompact)
+            {
+                BeginContourPaletteTransition(
+                    Color.FromArgb(255, 56, 189, 248),
+                    Color.FromArgb(255, 168, 85, 247),
+                    Color.FromArgb(255, 236, 72, 153),
+                    allowButtonOrigin: false);
+            }
             return;
         }
 
@@ -2338,6 +2505,15 @@ public sealed class MediaDeckView : UserControl, IMorphView
             if (ver != _compactCoverLoadVer) return;
             _compactCoverImg.Source = bmp;
             _compactCoverFallback.Opacity = 0;
+
+            if (triggerPaletteIfCompact)
+            {
+                var palette = await ExtractCoverPaletteAsync(bytes);
+                if (ver == _compactCoverLoadVer && _progress < 0.5)
+                {
+                    BeginContourPaletteTransition(palette.Left, palette.Center, palette.Right, allowButtonOrigin: false);
+                }
+            }
         }
         catch
         {
@@ -2357,9 +2533,11 @@ public sealed class MediaDeckView : UserControl, IMorphView
         {
             _coverImg.Source = null;
             _coverFallback.Opacity = 1;
-            _targetCoverLeft = Color.FromArgb(255, 56, 189, 248);
-            _targetCoverCenter = Color.FromArgb(255, 168, 85, 247);
-            _targetCoverRight = Color.FromArgb(255, 236, 72, 153);
+            BeginContourPaletteTransition(
+                Color.FromArgb(255, 56, 189, 248),
+                Color.FromArgb(255, 168, 85, 247),
+                Color.FromArgb(255, 236, 72, 153),
+                allowButtonOrigin: _progress >= 0.5);
             return;
         }
 
@@ -2373,9 +2551,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             var palette = await ExtractCoverPaletteAsync(bytes);
             if (ver == _coverLoadVer)
             {
-                _targetCoverLeft = palette.Left;
-                _targetCoverCenter = palette.Center;
-                _targetCoverRight = palette.Right;
+                BeginContourPaletteTransition(palette.Left, palette.Center, palette.Right, allowButtonOrigin: _progress >= 0.5);
             }
         }
         catch

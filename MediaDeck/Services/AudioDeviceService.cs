@@ -166,6 +166,26 @@ public sealed class AudioDeviceService : IDisposable
     public int StepMasterVolume(int deltaPercent)
         => SetMasterVolume(_masterVolumePercent + deltaPercent);
 
+    /// <summary>切换系统主音量静音状态，乐观更新 UI 并异步写入 CoreAudio。</summary>
+    public bool ToggleMasterMute()
+    {
+        bool nextMuted = !_masterMuted;
+        _masterMuted = nextMuted;
+        Interlocked.Exchange(ref _masterVolLockUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(600).UtcTicks);
+
+        EnqueueWork(() =>
+        {
+            if (_enumerator is null) return;
+            try
+            {
+                using var def = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                def.AudioEndpointVolume.Mute = nextMuted;
+            }
+            catch { }
+        });
+        return nextMuted;
+    }
+
     /// <summary>向后台音频线程投递全量缓存刷新（立即返回，不阻塞调用方）。</summary>
     public void RequestRefreshAll()
     {

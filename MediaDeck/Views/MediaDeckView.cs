@@ -241,6 +241,9 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private byte[]? _lastCoverBytes;
     private byte[]? _lastCompactCoverBytes;
     private byte[]? _lastAppIconBytes;
+    private int _coverLoadVer;
+    private int _compactCoverLoadVer;
+    private int _appIconLoadVer;
     private string _currentSourceName = "媒体播放器";
     private TimeSpan _currentDuration = TimeSpan.Zero;
     private double _lastRatio;
@@ -415,9 +418,18 @@ public sealed class MediaDeckView : UserControl, IMorphView
             FontSize = 12.5,
             FontWeight = FontWeights.Medium,
             Foreground = _textBrush,
+            TextWrapping = TextWrapping.NoWrap,
             TextTrimming = TextTrimming.CharacterEllipsis,
             VerticalAlignment = VerticalAlignment.Center,
             RenderTransform = _compactMarqueeTx,
+        };
+
+        // 使用横向 StackPanel 承载文本，避免 Grid 将 TextBlock 布局槽硬裁切至视口宽度导致滚动时后半段歌词缺失或字被截半
+        var compactMarqueeHost = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { _compactTitle },
         };
 
         _compactTextViewport = new Grid
@@ -425,7 +437,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             VerticalAlignment = VerticalAlignment.Center,
             HorizontalAlignment = HorizontalAlignment.Stretch,
             Clip = _compactClipGeo,
-            Children = { _compactTitle },
+            Children = { compactMarqueeHost },
         };
         _compactTextViewport.SizeChanged += (_, e) =>
         {
@@ -1205,10 +1217,10 @@ public sealed class MediaDeckView : UserControl, IMorphView
         }
 
         EnsureAuroraTimerRunning();
-        if (!string.Equals(_currentInstanceId, current.Id, StringComparison.OrdinalIgnoreCase))
+        bool instanceChanged = !string.Equals(_currentInstanceId, current.Id, StringComparison.OrdinalIgnoreCase);
+        if (instanceChanged)
         {
             _currentInstanceId = current.Id;
-            _lastCoverBytes = null; // 切换实例时强制刷新封面与轮廓光主色，防止沿用上一个实例颜色
             CloseAlarmPopup();
         }
         _isPlaying = current.IsPlaying;
@@ -1237,8 +1249,8 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _lyricCurr.Text = lyrics.Current;
         _lyricNext.Text = lyrics.Next;
 
-        UpdateCoverImage(current.ThumbnailBytes);
-        UpdateAppIconImage(current.AppIconBytes);
+        UpdateCoverImage(current.ThumbnailBytes, force: instanceChanged);
+        UpdateAppIconImage(current.AppIconBytes, force: instanceChanged);
         RebuildInstanceDots(totalCount, selectedIndex);
     }
 
@@ -1315,16 +1327,18 @@ public sealed class MediaDeckView : UserControl, IMorphView
             // 无歌词显示歌曲名称时：保持旧行为（不滚动，超出显示“……”）
             _compactTitle.TextTrimming = TextTrimming.CharacterEllipsis;
             _compactTitle.Width = vw > 0 ? vw : double.NaN;
+            _compactTitle.MaxWidth = vw > 0 ? vw : double.PositiveInfinity;
             _compactTextFullWidth = 0;
             _compactMarqueeTx.X = 0;
             return;
         }
 
-        // 有同步歌词时：测量完整宽度，超长则自动平滑滚动
+        // 有同步歌词时：解除宽度限制，让横向 StackPanel 按完整文本宽度排版并平滑滚动
         _compactTitle.TextTrimming = TextTrimming.None;
         _compactTitle.Width = double.NaN;
+        _compactTitle.MaxWidth = double.PositiveInfinity;
         _compactTitle.Measure(new Size(double.PositiveInfinity, CompactHeight));
-        _compactTextFullWidth = _compactTitle.DesiredSize.Width;
+        _compactTextFullWidth = Math.Ceiling(_compactTitle.DesiredSize.Width);
 
         if (vw > 0 && _compactTextFullWidth <= vw + 2)
         {
@@ -2309,6 +2323,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
     {
         if (ReferenceEquals(bytes, _lastCompactCoverBytes)) return;
         _lastCompactCoverBytes = bytes;
+        int ver = ++_compactCoverLoadVer;
 
         if (bytes is null || bytes.Length == 0)
         {
@@ -2320,20 +2335,23 @@ public sealed class MediaDeckView : UserControl, IMorphView
         try
         {
             var bmp = await BytesToBitmapAsync(bytes);
-            if (!ReferenceEquals(bytes, _lastCompactCoverBytes)) return;
+            if (ver != _compactCoverLoadVer) return;
             _compactCoverImg.Source = bmp;
             _compactCoverFallback.Opacity = 0;
         }
         catch
         {
+            if (ver != _compactCoverLoadVer) return;
+            _compactCoverImg.Source = null;
             _compactCoverFallback.Opacity = 1;
         }
     }
 
-    private async void UpdateCoverImage(byte[]? bytes)
+    private async void UpdateCoverImage(byte[]? bytes, bool force = false)
     {
-        if (ReferenceEquals(bytes, _lastCoverBytes)) return;
+        if (!force && ReferenceEquals(bytes, _lastCoverBytes)) return;
         _lastCoverBytes = bytes;
+        int ver = ++_coverLoadVer;
 
         if (bytes is null || bytes.Length == 0)
         {
@@ -2348,12 +2366,12 @@ public sealed class MediaDeckView : UserControl, IMorphView
         try
         {
             var bmp = await BytesToBitmapAsync(bytes);
-            if (!ReferenceEquals(bytes, _lastCoverBytes)) return;
+            if (ver != _coverLoadVer) return;
             _coverImg.Source = bmp;
             _coverFallback.Opacity = 0;
 
             var palette = await ExtractCoverPaletteAsync(bytes);
-            if (ReferenceEquals(bytes, _lastCoverBytes))
+            if (ver == _coverLoadVer)
             {
                 _targetCoverLeft = palette.Left;
                 _targetCoverCenter = palette.Center;
@@ -2362,6 +2380,8 @@ public sealed class MediaDeckView : UserControl, IMorphView
         }
         catch
         {
+            if (ver != _coverLoadVer) return;
+            _coverImg.Source = null;
             _coverFallback.Opacity = 1;
         }
     }
@@ -2448,10 +2468,11 @@ public sealed class MediaDeckView : UserControl, IMorphView
             (byte)Math.Clamp(nb, 30, 255));
     }
 
-    private async void UpdateAppIconImage(byte[]? bytes)
+    private async void UpdateAppIconImage(byte[]? bytes, bool force = false)
     {
-        if (ReferenceEquals(bytes, _lastAppIconBytes)) return;
+        if (!force && ReferenceEquals(bytes, _lastAppIconBytes)) return;
         _lastAppIconBytes = bytes;
+        int ver = ++_appIconLoadVer;
 
         if (bytes is null || bytes.Length == 0)
         {
@@ -2463,12 +2484,14 @@ public sealed class MediaDeckView : UserControl, IMorphView
         try
         {
             var bmp = await BytesToBitmapAsync(bytes);
-            if (!ReferenceEquals(bytes, _lastAppIconBytes)) return;
+            if (ver != _appIconLoadVer) return;
             _sourceIconImg.Source = bmp;
             _sourceIconFallback.Opacity = 0;
         }
         catch
         {
+            if (ver != _appIconLoadVer) return;
+            _sourceIconImg.Source = null;
             _sourceIconFallback.Opacity = 1;
         }
     }

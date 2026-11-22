@@ -19,6 +19,8 @@ public sealed record MediaInstanceInfo
     public string Artist { get; init; } = "";
     public string Album { get; init; } = "";
     public string? NetEaseSongId { get; init; }
+    public string? LocalFilePath { get; init; }
+    public IntPtr PotPlayerHwnd { get; init; }
     public bool IsPlaying { get; init; }
     public TimeSpan Position { get; init; }
     public TimeSpan Duration { get; init; }
@@ -71,6 +73,7 @@ public sealed class MediaSessionService : IDisposable
     private readonly AudioDeviceService _audioService;
     private readonly LyricsService _lyricsService;
     private readonly NetEaseElogService _netEaseElog;
+    private readonly PotPlayerService _potPlayer;
     private readonly Action<string> _log;
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly ConcurrentDictionary<string, ResolvedAppInfo?> _appsFolderCache = new(StringComparer.OrdinalIgnoreCase);
@@ -140,6 +143,7 @@ public sealed class MediaSessionService : IDisposable
         _audioService = audioService;
         _lyricsService = lyricsService;
         _netEaseElog = new NetEaseElogService(log);
+        _potPlayer = new PotPlayerService(log);
         _log = log;
     }
 
@@ -190,6 +194,41 @@ public sealed class MediaSessionService : IDisposable
             var smtcCoveredHints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var dupCounter = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
+            // 0) PotPlayer 原生多实例 Win32 IPC 通道（彻底绕过 PotPlayer 多开时的 SMTC 冲突、空标题与封面串台）
+            bool hasNativePotPlayer = false;
+            try
+            {
+                var potInstances = await _potPlayer.GetActiveInstancesAsync().ConfigureAwait(false);
+                foreach (var p in potInstances)
+                {
+                    hasNativePotPlayer = true;
+                    string potId = $"potplayer:{p.Hwnd.ToInt64():X}";
+                    snapshotMap[potId] = new MediaInstanceInfo
+                    {
+                        Id = potId,
+                        SourceAppId = "PotPlayerMini64.exe",
+                        SourceDisplayName = "PotPlayer",
+                        ProcessId = p.ProcessId,
+                        ExePath = p.ExePath,
+                        PotPlayerHwnd = p.Hwnd,
+                        LocalFilePath = p.FullFilePath,
+                        Title = p.Title,
+                        Artist = p.Artist,
+                        Album = p.Album,
+                        IsPlaying = p.IsPlaying,
+                        Position = p.Position,
+                        Duration = p.Duration,
+                        TimelineUpdatedAt = DateTimeOffset.UtcNow,
+                        ThumbnailBytes = p.ThumbnailBytes,
+                        AppIconBytes = p.AppIconBytes,
+                    };
+                    smtcCoveredHints.Add("PotPlayer");
+                    smtcCoveredHints.Add("PotPlayerMini64");
+                    smtcCoveredHints.Add("PotPlayerMini");
+                }
+            }
+            catch { }
+
             // 1) 主通道：枚举全部 SMTC 会话（不因暂停或暂缺标题而丢弃 Spotify 等有效会话）
             if (_manager is not null)
             {
@@ -200,6 +239,11 @@ public sealed class MediaSessionService : IDisposable
                     try
                     {
                         var appId = s.SourceAppUserModelId ?? $"unknown-{i}";
+                        // 若原生 PotPlayer IPC 通道已接管，跳过系统 SMTC 中易冲突的 PotPlayer 会话
+                        if (hasNativePotPlayer && appId.Contains("PotPlayer", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
                         dupCounter.TryGetValue(appId, out int count);
                         dupCounter[appId] = count + 1;
                         string stableId = count == 0 ? $"smtc:{appId}" : $"smtc:{appId}#{count}";
@@ -336,6 +380,14 @@ public sealed class MediaSessionService : IDisposable
         var cur = GetInstanceById(instanceId);
         if (cur is null) return;
 
+        if (cur.PotPlayerHwnd != IntPtr.Zero)
+        {
+            PotPlayerService.TogglePlayPause(cur.PotPlayerHwnd);
+            await Task.Delay(120).ConfigureAwait(false);
+            await RefreshAsync().ConfigureAwait(false);
+            return;
+        }
+
         if (cur.SmtcSession is not null)
         {
             try
@@ -367,6 +419,14 @@ public sealed class MediaSessionService : IDisposable
         var cur = GetInstanceById(instanceId);
         if (cur is null) return;
 
+        if (cur.PotPlayerHwnd != IntPtr.Zero)
+        {
+            PotPlayerService.Next(cur.PotPlayerHwnd);
+            await Task.Delay(180).ConfigureAwait(false);
+            await RefreshAsync().ConfigureAwait(false);
+            return;
+        }
+
         if (cur.SmtcSession is not null)
         {
             try
@@ -391,6 +451,14 @@ public sealed class MediaSessionService : IDisposable
     {
         var cur = GetInstanceById(instanceId);
         if (cur is null) return;
+
+        if (cur.PotPlayerHwnd != IntPtr.Zero)
+        {
+            PotPlayerService.Previous(cur.PotPlayerHwnd);
+            await Task.Delay(180).ConfigureAwait(false);
+            await RefreshAsync().ConfigureAwait(false);
+            return;
+        }
 
         if (cur.SmtcSession is not null)
         {
@@ -419,6 +487,14 @@ public sealed class MediaSessionService : IDisposable
         if (cur is null || cur.Duration <= TimeSpan.Zero) return true;
 
         var clamped = TimeSpan.FromTicks(Math.Clamp(target.Ticks, 0, cur.Duration.Ticks));
+        if (cur.PotPlayerHwnd != IntPtr.Zero)
+        {
+            PotPlayerService.Seek(cur.PotPlayerHwnd, clamped);
+            await Task.Delay(100).ConfigureAwait(false);
+            await RefreshAsync().ConfigureAwait(false);
+            return true;
+        }
+
         if (cur.SmtcSession is not null)
         {
             try
@@ -464,7 +540,11 @@ public sealed class MediaSessionService : IDisposable
 
         if (target.IsPlaying)
         {
-            if (target.SmtcSession is not null)
+            if (target.PotPlayerHwnd != IntPtr.Zero)
+            {
+                PotPlayerService.Pause(target.PotPlayerHwnd);
+            }
+            else if (target.SmtcSession is not null)
             {
                 try { await target.SmtcSession.TryPauseAsync(); } catch { }
             }
@@ -482,7 +562,11 @@ public sealed class MediaSessionService : IDisposable
         }
 
         // 目标实例未在播放：触发该实例播放
-        if (target.SmtcSession is not null)
+        if (target.PotPlayerHwnd != IntPtr.Zero)
+        {
+            PotPlayerService.Play(target.PotPlayerHwnd);
+        }
+        else if (target.SmtcSession is not null)
         {
             try { await target.SmtcSession.TryPlayAsync(); } catch { }
         }
@@ -504,6 +588,10 @@ public sealed class MediaSessionService : IDisposable
     {
         var cur = GetInstanceById(instanceId);
         if (cur is null) return false;
+        if (cur.PotPlayerHwnd != IntPtr.Zero)
+        {
+            return PolicyConfigInterop.ActivateWindowHandle(cur.PotPlayerHwnd);
+        }
         return PolicyConfigInterop.ActivateWindowByProcessIdOrName(
             cur.ProcessId,
             cur.SourceAppId,
@@ -774,6 +862,7 @@ public sealed class MediaSessionService : IDisposable
     public void Dispose()
     {
         _disposed = true;
+        _potPlayer.Dispose();
         _netEaseElog.Dispose();
         _refreshGate.Dispose();
     }

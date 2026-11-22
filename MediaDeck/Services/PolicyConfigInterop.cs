@@ -144,6 +144,52 @@ internal static class PolicyConfigInterop
         ref Guid riid,
         [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
 
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
+    private static extern int SHCreateItemFromParsingName(
+        [MarshalAs(UnmanagedType.LPWStr)] string pszPath,
+        IntPtr pbc,
+        ref Guid riid,
+        [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+
+    private const uint SIIGBF_THUMBNAILONLY = 0x08;
+
+    /// <summary>
+    /// 通过 Windows Shell 提取本地音频/视频文件的真实内嵌封面或视频缩略图（不带默认文件图标兜底）。
+    /// </summary>
+    public static async Task<byte[]?> ExtractFileThumbnailPngAsync(string filePath, int size = 160)
+    {
+        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath)) return null;
+        try
+        {
+            var iid = IidIShellItem;
+            int hr = SHCreateItemFromParsingName(filePath, IntPtr.Zero, ref iid, out var obj);
+            if (hr != 0 || obj is not IShellItemImageFactory factory) return null;
+
+            var sz = new SIZE { cx = size, cy = size };
+            int hrImg = factory.GetImage(sz, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK, out IntPtr hbm);
+            if (hrImg != 0 || hbm == IntPtr.Zero) return null;
+
+            try
+            {
+                return await HBitmapToPngAsync(hbm).ConfigureAwait(false);
+            }
+            finally
+            {
+                DeleteObject(hbm);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static bool ActivateWindowHandle(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return false;
+        return BringWindowToFront(hWnd);
+    }
+
     /// <summary>
     /// 通过 Windows Shell AppsFolder 直接解析任意 AUMID（含 Firefox/Zen 16位哈希 AUMID、UWP/MSIX 应用）
     /// 为官方显示名与图标 PNG 字节流，与 Windows 系统媒体管理器同源。

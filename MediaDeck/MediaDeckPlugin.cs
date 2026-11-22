@@ -397,8 +397,8 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         _lyricsService.EnsureLyricsAsync(inst.Title, inst.Artist, inst.Duration, () =>
         {
             if (!_stopped) RunOnUI(RenderMediaSnapshot);
-        }, inst.NetEaseSongId);
-        return _lyricsService.GetTriplet(inst.Title, inst.Artist, inst.EstimatedPosition);
+        }, inst.NetEaseSongId, inst.SourceAppId, inst.LocalFilePath);
+        return _lyricsService.GetTriplet(inst.Title, inst.Artist, inst.EstimatedPosition, inst.LocalFilePath);
     }
 
     private (VisualEffectMode Mode, double Reactivity, bool GlowOn, double GlowSize, double GlowOpacity) ReadVisualConfig()

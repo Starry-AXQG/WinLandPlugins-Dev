@@ -67,7 +67,7 @@
 | 网卡上传 / 下载速率 | `.NET NetworkInterface` 字节增量（自动过滤虚拟隧道与重复 WFP/QoS 过滤驱动） |
 | 电池容量 / 损耗 / 电压 / 充放功率 | LibreHardwareMonitor 电池组 + `kernel32 GetSystemPowerStatus` |
 
-> **关于 CPU 温度**：Windows 不向普通权限进程开放 AMD Tctl/Tdie 等内核级结温寄存器，插件读取主板 ACPI 热区温度，读数随 CPU 负载变化明显，并在聚光卡中标注来源为「ACPI 整机热区」。
+> **关于台式机 CPU 温度**：普通权限下插件用主板 ACPI 热区作为免驱动兜底，但部分台式机主板 BIOS 不暴露 ACPI 热区。可在插件设置页底部的「台式机 CPU 温度与驱动状态」卡片中**一键安装微软签名的开源驱动 PawnIO**，再以管理员身份重启 WinIsland（或在 WinIsland「通用」设置开启「管理员权限自启动」），即可直接读取精确 CPU 结温（AMD `Tctl/Tdie` / Intel `CPU Package`）。不需要时可随时在设置页**一键卸载 PawnIO** 恢复原状。
 
 **整机总功耗计算方式**：
 - **电池供电时**：直接采用电池放电功率（实测值）。
@@ -118,6 +118,7 @@ hw-sensors/
 │   ├── SensorService.cs         # 后台独立采样线程：整合 LHM、PDH、NetworkInterface 与系统电源状态
 │   ├── SensorSnapshot.cs        # 采样数据模型（SensorSnapshot、GpuSnapshot、SensorOptions、GpuChoice、NicChoice）
 │   ├── PdhSet.cs                # 免管理员 Windows PDH 封装（RAPL CPU 封装功耗 + ACPI 热区温度）
+│   ├── PawnIoHelper.cs          # 管理员权限与 PawnIO 驱动状态检测，提供官方安装包一键安装与一键卸载
 │   └── SpeedFormatter.cs        # 网速格式化工具（卡片 3 位有效数字规则 + 胶囊紧凑格式规则）
 ├── deploy.ps1                   # 本地一键编译、停宿主、部署到 WinIsland 插件目录脚本
 ├── logo.png                     # 插件图标

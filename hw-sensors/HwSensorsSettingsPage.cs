@@ -70,6 +70,12 @@ internal sealed class HwSensorsSettingsPage
     private NumberBox _interval = null!;
     private TextBlock _status = null!;
 
+    private TextBlock _driverStatusLine = null!;
+    private TextBlock _driverHintText = null!;
+    private Button _pawnIoActionBtn = null!;
+    private TextBlock _pawnIoProgressText = null!;
+    private bool _pawnIoBusy;
+
     public HwSensorsSettingsPage(HwSensorsPlugin plugin)
     {
         _plugin = plugin;
@@ -361,11 +367,138 @@ internal sealed class HwSensorsSettingsPage
         panel.Children.Add(actions);
         panel.Children.Add(_status);
 
+        // ---- 底部智能状态提示卡片（管理员权限 & PawnIO 驱动一键装卸） ----
+        panel.Children.Add(SectionTitle("CPU温度获取方式："));
+        panel.Children.Add(BuildDriverStatusCard());
+
         RebuildCapsuleCheckboxes();
         UpdateCapsuleSummary();
+        RefreshDriverStatusUi();
 
         _loading = false;
         return panel;
+    }
+
+    private Border BuildDriverStatusCard()
+    {
+        _driverStatusLine = new TextBlock
+        {
+            FontSize = 13,
+            FontWeight = FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap,
+        };
+
+        _driverHintText = new TextBlock
+        {
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.8,
+        };
+
+        _pawnIoActionBtn = new Button { Content = "一键安装 PawnIO" };
+        _pawnIoActionBtn.Click += async (_, _) => await OnPawnIoActionClickAsync();
+
+        var openSiteBtn = new Button { Content = "打开 PawnIO 官网" };
+        openSiteBtn.Click += (_, _) => PawnIoHelper.OpenOfficialHomepage();
+
+        var recheckBtn = new Button { Content = "重新检测状态" };
+        recheckBtn.Click += (_, _) =>
+        {
+            RefreshDriverStatusUi();
+            _pawnIoProgressText.Text = "已刷新权限与 PawnIO 驱动状态。";
+        };
+
+        var btnRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        btnRow.Children.Add(_pawnIoActionBtn);
+        btnRow.Children.Add(openSiteBtn);
+        btnRow.Children.Add(recheckBtn);
+
+        _pawnIoProgressText = new TextBlock
+        {
+            FontSize = 11.5,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.78,
+        };
+
+        var stack = new StackPanel { Spacing = 8 };
+        stack.Children.Add(_driverStatusLine);
+        stack.Children.Add(_driverHintText);
+        stack.Children.Add(btnRow);
+        stack.Children.Add(_pawnIoProgressText);
+
+        return Card(stack);
+    }
+
+    private void RefreshDriverStatusUi()
+    {
+        var isAdmin = PawnIoHelper.IsRunningAsAdmin();
+        var hasPawnIo = PawnIoHelper.IsPawnIoInstalled();
+
+        var adminLabel = isAdmin ? "管理员" : "普通用户";
+        var pawnLabel = hasPawnIo ? "已安装" : "未安装";
+        _driverStatusLine.Text = $"当前运行权限：{adminLabel}　·　PawnIO 驱动：{pawnLabel}";
+
+        _driverHintText.Text =
+            "插件支持免管理员方式获取温度，若在非管理员状态下无法成功获取到CPU温度，需要安装PawnIO驱动并使用管理员运行 WinIsland。\n"
+            + "PawnIO驱动可能已经随本机安装的其他硬件监控软件或外设控制软件自动安装过，将会自动调用；如未安装，请在此处安装；如果此电脑在非管理员下已经可以获取CPU温度，可忽略。若确保本电脑无其他软件使用PawnIO，可在此处卸载。";
+
+        _pawnIoActionBtn.Content = hasPawnIo ? "一键卸载 PawnIO" : "一键安装 PawnIO";
+        _pawnIoActionBtn.IsEnabled = !_pawnIoBusy;
+    }
+
+    private async Task OnPawnIoActionClickAsync()
+    {
+        if (_pawnIoBusy) return;
+        _pawnIoBusy = true;
+        _pawnIoActionBtn.IsEnabled = false;
+
+        var installing = !PawnIoHelper.IsPawnIoInstalled();
+        var dispatcher = _pawnIoProgressText.DispatcherQueue;
+
+        void SetProgress(string msg)
+        {
+            if (dispatcher is not null)
+                dispatcher.TryEnqueue(() => _pawnIoProgressText.Text = msg);
+            else
+                _pawnIoProgressText.Text = msg;
+        }
+
+        try
+        {
+            // 卸载前先暂停采样并释放 LHM 句柄，避免驱动被本进程占用导致卸载失败
+            if (!installing && _plugin.Service is not null)
+            {
+                SetProgress("正在暂停硬件采样以释放驱动占用…");
+                await _plugin.Service.SuspendForDriverChangeAsync();
+            }
+
+            var (ok, message) = installing
+                ? await PawnIoHelper.InstallAsync(SetProgress)
+                : await PawnIoHelper.UninstallAsync(SetProgress);
+
+            SetProgress(message);
+
+            // 安装或卸载完成后重新打开采样器，立即生效（若已管理员运行则立刻读到精确温度）
+            if (_plugin.Service is not null)
+            {
+                if (installing)
+                {
+                    await _plugin.Service.SuspendForDriverChangeAsync();
+                }
+                _plugin.Service.ResumeAfterDriverChange();
+            }
+
+            _plugin.LogInfo($"PawnIO {(installing ? "安装" : "卸载")}结果（ok={ok}）：{message}");
+        }
+        catch (Exception ex)
+        {
+            SetProgress($"操作异常：{ex.Message}");
+        }
+        finally
+        {
+            _pawnIoBusy = false;
+            RefreshDriverStatusUi();
+        }
     }
 
     private int DetectInitialCategoryIndex()

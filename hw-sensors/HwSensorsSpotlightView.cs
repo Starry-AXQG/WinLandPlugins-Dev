@@ -273,7 +273,7 @@ public sealed class HwSensorsSpotlightView : UserControl
         // ============================================================
         var footer = new TextBlock
         {
-            Text = "数据说明：GPU 占用率优先取 WDDM D3D 引擎负载最大值（与 Windows 任务管理器对齐）；CPU 功耗与温度来自免管理员 RAPL / ACPI 通道；多显卡设备在此面板全部展示，悬停卡片仅显示设置中指定的主显卡。",
+            Text = "数据说明：GPU 占用率优先取 WDDM D3D 引擎负载最大值（与 Windows 任务管理器对齐）；CPU 功耗与温度优先通过 PawnIO 驱动直读 CPU 传感器（需管理员权限），不可用时自动回退至免管理员 RAPL / ACPI 通道；多显卡设备在此面板全部展示，悬停卡片仅显示设置中指定的主显卡。",
             FontSize = 11,
             TextWrapping = TextWrapping.Wrap,
             Foreground = _faintBrush,

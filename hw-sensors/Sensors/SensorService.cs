@@ -72,6 +72,28 @@ public sealed class SensorService : IDisposable
 
     public void RequestRefresh() => _wake.Set();
 
+    /// <summary>卸载 PawnIO 驱动前暂停采样并释放 LHM 驱动句柄，避免卸载时提示服务被占用。</summary>
+    public async Task SuspendForDriverChangeAsync()
+    {
+        var t = _thread;
+        if (t is null) return;
+
+        _stopping = true;
+        _wake.Set();
+        await Task.Run(() =>
+        {
+            try { t.Join(3000); } catch { /* 忽略 */ }
+        });
+        _thread = null;
+    }
+
+    /// <summary>安装或卸载 PawnIO 完成后重新打开 LHM 与采样线程，无需重启即可生效。</summary>
+    public void ResumeAfterDriverChange()
+    {
+        _openFailed = false;
+        Start();
+    }
+
     private void Loop()
     {
         Open();
@@ -170,6 +192,7 @@ public sealed class SensorService : IDisposable
             {
                 if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
                 if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                if (IsFilterOrVirtualNoise(nic)) continue;
                 list.Add(new NicChoice(nic.Id, nic.Name, nic.Description));
             }
             _nics = list;
@@ -269,18 +292,24 @@ public sealed class SensorService : IDisposable
                 ReadBattery(battery, snapshot);
         }
 
-        // ---- CPU 温度 / 功耗：PDH ----
+        // ---- CPU 温度 / 功耗：仅当 LHM 未读到精确值时，用 PDH（ACPI 热区 / RAPL）兜底 ----
         if (_pdh is not null)
         {
-            var pdhTemp = _pdh.ThermalZoneC();
-            if (pdhTemp is not null)
+            if (snapshot.CpuTempC is null)
             {
-                snapshot.CpuTempC = pdhTemp;
-                snapshot.CpuTempIsApprox = true;
+                var pdhTemp = _pdh.ThermalZoneC();
+                if (pdhTemp is not null)
+                {
+                    snapshot.CpuTempC = pdhTemp;
+                    snapshot.CpuTempIsApprox = true;
+                }
             }
 
-            var pdhPower = _pdh.PackagePowerW();
-            if (pdhPower is not null) snapshot.CpuPowerW = pdhPower;
+            if (snapshot.CpuPowerW is null)
+            {
+                var pdhPower = _pdh.PackagePowerW();
+                if (pdhPower is not null) snapshot.CpuPowerW = pdhPower;
+            }
         }
 
         // ---- 网卡上传 / 下载速率 ----
@@ -331,9 +360,15 @@ public sealed class SensorService : IDisposable
         cpu.Update();
         s.CpuName = cpu.Name;
 
+        // 兼容 AMD (Core (Tctl/Tdie)) 与 Intel (CPU Package / Core Average / Core Max)
+        double? bestTemp = null;
+        int bestTempRank = int.MaxValue;
+        double? bestPower = null;
+        int bestPowerRank = int.MaxValue;
+
         foreach (var sensor in cpu.Sensors)
         {
-            if (sensor.Value is not { } value) continue;
+            if (sensor.Value is not { } value || float.IsNaN(value)) continue;
 
             switch (sensor.SensorType)
             {
@@ -341,17 +376,66 @@ public sealed class SensorService : IDisposable
                     s.CpuLoadPct = value;
                     break;
 
-                case SensorType.Temperature when value > 0 && s.CpuTempC is null &&
-                                                 sensor.Name.Contains("Tctl", StringComparison.OrdinalIgnoreCase):
-                    s.CpuTempC = value;
+                case SensorType.Temperature when value > 0 && value < 150:
+                {
+                    var rank = CpuTempRank(sensor.Name);
+                    if (rank < bestTempRank)
+                    {
+                        bestTemp = value;
+                        bestTempRank = rank;
+                    }
                     break;
+                }
 
-                case SensorType.Power when value > 0 && s.CpuPowerW is null &&
-                                           sensor.Name.Equals("Package", StringComparison.OrdinalIgnoreCase):
-                    s.CpuPowerW = value;
+                case SensorType.Power when value > 0:
+                {
+                    var rank = CpuPowerRank(sensor.Name);
+                    if (rank < bestPowerRank)
+                    {
+                        bestPower = value;
+                        bestPowerRank = rank;
+                    }
                     break;
+                }
             }
         }
+
+        if (bestTemp is not null)
+        {
+            s.CpuTempC = bestTemp;
+            s.CpuTempIsApprox = false;
+        }
+
+        if (bestPower is not null)
+        {
+            s.CpuPowerW = bestPower;
+        }
+    }
+
+    private static int CpuTempRank(string name)
+    {
+        if (name.Equals("Core (Tctl/Tdie)", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("CPU Package", StringComparison.OrdinalIgnoreCase))
+            return 0;
+        if (name.Contains("Tdie", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Tctl", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("Core Average", StringComparison.OrdinalIgnoreCase))
+            return 1;
+        if (name.Equals("Core Max", StringComparison.OrdinalIgnoreCase))
+            return 2;
+        if (name.Contains("Package", StringComparison.OrdinalIgnoreCase))
+            return 3;
+        return 10;
+    }
+
+    private static int CpuPowerRank(string name)
+    {
+        if (name.Equals("Package", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("CPU Package", StringComparison.OrdinalIgnoreCase))
+            return 0;
+        if (name.Contains("Package", StringComparison.OrdinalIgnoreCase))
+            return 1;
+        return 99;
     }
 
     private static void ReadMemory(IHardware mem, SensorSnapshot s)
@@ -416,6 +500,7 @@ public sealed class SensorService : IDisposable
 
         double? d3dMaxLoad = null;
         double? fallbackTemp = null;
+        double? vramLoadFallback = null;
         double? d3dDedUsed = null;
         double? d3dDedTotal = null;
 
@@ -461,7 +546,8 @@ public sealed class SensorService : IDisposable
                     }
                     else if (sensor.Name.Equals("GPU Memory", StringComparison.OrdinalIgnoreCase))
                     {
-                        g.VramLoadPct = Math.Clamp((double)value, 0.0, 100.0);
+                        // 注意：在 AMD 显卡上该传感器常为显存控制器带宽负载而非容量占用，仅作兜底
+                        vramLoadFallback = Math.Clamp((double)value, 0.0, 100.0);
                     }
                     break;
 
@@ -484,12 +570,16 @@ public sealed class SensorService : IDisposable
         // GPU 占用率：优先采用与任务管理器一致的 max(D3D *)，无 D3D 传感器时回退 GPU Core
         g.LoadPct = d3dMaxLoad ?? g.CoreLoadPct;
 
-        // 显存容量兜底与占用率推算
+        // 显存容量占用率：优先按 已用 / 总量 计算（N 卡与 A 卡均与任务管理器一致），拿不到容量时才回退 Load 传感器
         g.VramUsedMb ??= d3dDedUsed;
         g.VramTotalMb ??= d3dDedTotal;
-        if (g.VramLoadPct is null && g.VramUsedMb is >= 0 && g.VramTotalMb is > 0)
+        if (g.VramUsedMb is >= 0 && g.VramTotalMb is > 0)
         {
             g.VramLoadPct = Math.Clamp(g.VramUsedMb.Value / g.VramTotalMb.Value * 100.0, 0.0, 100.0);
+        }
+        else
+        {
+            g.VramLoadPct = vramLoadFallback;
         }
 
         return g;
@@ -582,8 +672,37 @@ public sealed class SensorService : IDisposable
         }
     }
 
+    /// <summary>过滤 Windows 底层包过滤驱动（WFP/QoS/WiFi Filter）与 Wi-Fi Direct 虚拟连接，防止同一张物理网卡流量被叠加 5 倍。</summary>
+    private static bool IsFilterOrVirtualNoise(NetworkInterface nic)
+    {
+        var name = nic.Name ?? string.Empty;
+        var desc = nic.Description ?? string.Empty;
+
+        if (name.Contains("Filter", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("QoS Packet Scheduler", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("WFP ", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("本地连接*", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Local Area Connection*", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (desc.Contains("Filter Driver", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("LightWeight Filter", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("QoS Packet Scheduler", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase)
+            || desc.Contains("WAN Miniport", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
     private static bool IsPhysicalAdapter(NetworkInterface nic)
     {
+        if (IsFilterOrVirtualNoise(nic)) return false;
+
         var type = nic.NetworkInterfaceType;
         if (type is NetworkInterfaceType.Loopback
             or NetworkInterfaceType.Tunnel

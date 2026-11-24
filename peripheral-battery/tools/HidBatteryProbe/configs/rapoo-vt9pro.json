@@ -1,0 +1,131 @@
+{
+  // 雷柏 Rapoo VT9PRO 专属探测配置（同时覆盖一代桌面驱动 0xBA 协议与二代网页驱动 0x06/0x07/0x08 协议）
+  // 逆向来源：
+  //   1. RapooGameDevDriver_Setup_1.6.29 (一代 VT9PRO: 有线 0x418A / 1K 无线 0x185A / 4K 0x1601 / V2M 0x1600 / HSDM 0x1205)
+  //   2. https://hub.rapoo.cn/ (二代 VT9 / VT9 PRO V2: 0x46A9 / 0x14A9 等 Nordic nRF54L 方案)
+  "brand": "Rapoo",
+  "modelHint": "雷柏 VT9PRO（兼容一代 1K/4K/V2M/HSDM 及二代全系）",
+  "driverSource": "RapooGameDev 1.6.29 + hub.rapoo.cn",
+  "notes": "仅发送只读电量查询指令 (0xBA/0xAA) 与只读状态监听，不修改任何鼠标配置。",
+  "targets": [
+    {
+      "name": "Rapoo Vendor HID Interfaces (0xFF00+)",
+      "vendorId": "0x24AE",
+      "minUsagePage": "0xFF00"
+    }
+  ],
+  "actions": [
+    {
+      "id": "rapoo-gen1-ctrl-wireless-battery-0xBA-A5-AA",
+      "description": "雷柏一代 2.4G 控制端点直读电量 (SetOutputReport 0xBA A5 AA -> GetInputReport 0xBA)",
+      "kind": "outputThenGetInput",
+      "filter": {
+        "minInputLength": 8,
+        "minOutputLength": 8
+      },
+      "requestHex": "BA A5 AA 00 00 00 00",
+      "responseReportId": "0xBA",
+      "busyByteIndex": 0,
+      "busyValue": "0x02",
+      "delayBeforeReadMs": 50,
+      "retryDelayMs": 50,
+      "maxRetries": 3
+    },
+    {
+      "id": "rapoo-gen1-ctrl-wired-battery-0xBA-FF-AA",
+      "description": "雷柏一代有线控制端点直读电量 (SetOutputReport 0xBA FF AA -> GetInputReport 0xBA)",
+      "kind": "outputThenGetInput",
+      "filter": {
+        "minInputLength": 8,
+        "minOutputLength": 8
+      },
+      "requestHex": "BA FF AA 00 00 00 00",
+      "responseReportId": "0xBA",
+      "busyByteIndex": 0,
+      "busyValue": "0x02",
+      "delayBeforeReadMs": 50,
+      "retryDelayMs": 50,
+      "maxRetries": 3
+    },
+    {
+      "id": "rapoo-gen1-wireless-battery-0xBA-A5-AA",
+      "description": "雷柏一代 2.4G 无线接收器直读电量 (ReportId=0xBA, Target=0xA5, Cmd=0xAA getBatteryValue)",
+      "kind": "outputThenInput",
+      "filter": {
+        "minInputLength": 8,
+        "minOutputLength": 8
+      },
+      "requestHex": "BA A5 AA 00 00 00 00",
+      "expectPrefixHex": "BA",
+      "busyByteIndex": 1,
+      "busyValue": "0x02",
+      "delayBeforeReadMs": 50,
+      "retryDelayMs": 50,
+      "timeoutMs": 350,
+      "maxReads": 4,
+      "flushQueueBeforeWrite": true
+    },
+    {
+      "id": "rapoo-gen1-wired-battery-0xBA-FF-AA",
+      "description": "雷柏一代有线模式直读电量 (ReportId=0xBA, Target=0xFF, Cmd=0xAA getBatteryValue)",
+      "kind": "outputThenInput",
+      "filter": {
+        "minInputLength": 8,
+        "minOutputLength": 8
+      },
+      "requestHex": "BA FF AA 00 00 00 00",
+      "expectPrefixHex": "BA",
+      "busyByteIndex": 1,
+      "busyValue": "0x02",
+      "delayBeforeReadMs": 50,
+      "retryDelayMs": 50,
+      "timeoutMs": 300,
+      "maxReads": 4,
+      "flushQueueBeforeWrite": true
+    },
+    {
+      "id": "rapoo-gen1-setfeature-battery-0xBA-A5-AA",
+      "description": "兜底检测：部分固件是否通过 SetFeature/GetFeature 响应 0xBA 电量查询",
+      "kind": "setFeatureThenGetFeature",
+      "filter": {
+        "minFeatureLength": 8
+      },
+      "requestHex": "BA A5 AA 00 00 00 00",
+      "responseReportId": "0xBA",
+      "expectPrefixHex": "BA",
+      "busyByteIndex": 1,
+      "busyValue": "0x02",
+      "delayBeforeReadMs": 50,
+      "retryDelayMs": 50,
+      "maxRetries": 3
+    },
+    {
+      "id": "rapoo-gen2-nordic-fwver-out06-feat08",
+      "description": "雷柏二代网页驱动通道检测：Output 0x06 只读查询固件版本 -> GetFeature 0x08",
+      "kind": "outputThenFeature",
+      "filter": {
+        "usagePage": "0xFF00",
+        "usage": "0x0002",
+        "minOutputLength": 4,
+        "minFeatureLength": 8
+      },
+      "requestHex": "06 A5 A3 00",
+      "responseReportId": "0x08",
+      "busyByteIndex": 1,
+      "busyValue": "0x02",
+      "delayBeforeReadMs": 20,
+      "retryDelayMs": 30,
+      "maxRetries": 4
+    },
+    {
+      "id": "rapoo-passive-input-listen",
+      "description": "纯被动监听厂商通道主动上报帧（如一代中断上报 / 二代 0x07 MouseUserData）",
+      "kind": "listenInput",
+      "filter": {
+        "minInputLength": 8
+      },
+      "timeoutMs": 600,
+      "maxReads": 3
+    }
+  ]
+}

@@ -18,5 +18,6 @@ internal static class DeviceSourceRegistry
         new BluetoothDeviceSource(),
         new VxeDeviceSource(),
         new MchoseDeviceSource(),
+        new RapooDeviceSource(),
     };
 }

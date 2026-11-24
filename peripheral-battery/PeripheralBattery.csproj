@@ -30,8 +30,12 @@
     <None Update="README.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
-  <!-- docs/ 只是 README 用的截图，logo.png 只给市场用：都不参与构建，也不能被打进 .lwp -->
+  <!-- docs/ 只是 README 用的截图，logo.png 只给市场用，tools/ 是独立诊断工具：都不参与插件构建，也不能被打进 .lwp -->
   <ItemGroup>
+    <Compile Remove="tools\**" />
+    <EmbeddedResource Remove="tools\**" />
+    <Content Remove="tools\**" />
+    <None Remove="tools\**" />
     <Content Remove="docs\**" />
     <None Remove="docs\**" />
     <None Include="docs\**" CopyToOutputDirectory="Never" />

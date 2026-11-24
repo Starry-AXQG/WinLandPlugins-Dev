@@ -112,7 +112,7 @@ public sealed class DeviceBattery
         var n = (name ?? "").ToLowerInvariant();
 
         if (Contains(n, "keyboard", "键盘", "g87", "k87", "k75", "k99", "键盘")) return PeripheralKind.Keyboard;
-        if (Contains(n, "mouse", "鼠标", "r1se", "vxe", "grip", "dgl", "mouse 1k")) return PeripheralKind.Mouse;
+        if (Contains(n, "mouse", "鼠标", "r1se", "vxe", "grip", "dgl", "mouse 1k", "vt9", "vt1", "vt2", "vt3", "v2m")) return PeripheralKind.Mouse;
         if (Contains(n, "headset", "headphone", "earbud", "buds", "耳机", "enco", "airpods", "free4", "wh-", "wf-", "airpod")) return PeripheralKind.Headset;
         if (Contains(n, "controller", "gamepad", "手柄", "xbox", "dualsense", "dualshock", "joy-con", "8bitdo")) return PeripheralKind.Gamepad;
         if (Contains(n, "phone", "手机", "iphone", "pixel", "redmi", "一加", "oneplus", "oppo", "vivo", "huawei", "荣耀", "xiaomi", "小米", "galaxy")) return PeripheralKind.Phone;

@@ -2,7 +2,7 @@
 
 在灵动岛上实时显示键盘、鼠标、耳机、手柄、手机的电量与充电状态，低电量时自动提醒充电。支持多种显示UI。
 
-- **设备支持**：支持所有标准蓝牙 / BLE 设备，以及 2.4G 无线外设。目前原生支持 **VXE / ATK（COMPX 方案）** 与 **MCHOSE 迈从（G87 V2 等 GLW 方案）** 2.4G 接收器通过 USB HID 私有协议直读实时电量，无需后台运行官方驱动。同时支持用户使用 AI Agent 快速逆向并添加新品牌适配，欢迎提交 PR。
+- **设备支持**：支持所有标准蓝牙 / BLE 设备，以及 2.4G 无线外设。2.4G品牌支持见下方支持列表。支持用户使用 AI Agent 快速逆向并添加新品牌适配，欢迎提交 PR。
 - **按告急程度排序**：设备列表默认按「电量告急程度」升序排列，越需要充电的设备排在越上方；卡片高度随设备数量自适应，并在上限内与同屏插件保持对齐。
 - **精准设备类型与图标**：蓝牙设备优先解析系统 `Class of Device (CoD)` 主次类别位段，2.4G 设备结合协议通道与产品名识别，准确区分键盘、鼠标、耳机、手柄、手机。
 - **灵活过滤与隐藏**：自动过滤已配对但未开机/休眠的蓝牙与 2.4G 设备；设置页支持按单台设备隐藏，或一键隐藏正在充电的设备。
@@ -24,6 +24,19 @@ _下面是两种显示UI的卡片预览_
 ![悬停展开的岛体](docs/island-card.png)
 
 ![悬停展开的岛体](docs/island-card1.png)
+
+---
+
+## 数据来源与已支持设备
+
+| 品牌 / 类别 | 型号 / 范围 | VID : PID | 协议通道与读取方式 |
+| --- | --- | --- | --- |
+| **蓝牙 / BLE** | 任意蓝牙耳机 / 手机 / 手柄 / 键鼠 | 任意 | Windows PnP 电池属性 `{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2` + WinRT AEP 在线过滤 |
+| **VXE / ATK** | Mouse 1K Dongle（R1SE+ 等 COMPX 接收器） | `3554:F58E` / `373B:*` | HID `UsagePage 0xFF02, Usage 0x0002`（17 字节 COMPX 协议，ReportId `0x08`：`cmd 0x03` 判在线 + `cmd 0x04` 直读电量/充电/电压） |
+| **MCHOSE 迈从** | G87 V2 等 GLW 方案 2.4G 键盘接收器 | `3837:3033` / `41E4:*` | HID `UsagePage 0x0001, Usage 0x0000`（65 字节 GLW 协议，ReportId `0x00`，`flag 0x55`，`cmd 0x05 getFuncConfig` 直读电量/充电/模式；非 GLW 旧设备回退 HUB 缓存） |
+| **Rapoo 雷柏** | VT9PRO / V2M 4K 及一代 VT/V 全系无线游戏鼠标 | `24AE:1205` / `185A` / `1601` / `1600` / `4405` / `418A` 等 | HID `UsagePage 0xFF00, Usage 0x000E`（32 字节 `0xBA` 协议，`target 0xA5/0xFF`，`cmd 0xAA`：经控制端点 `HidD_SetOutputReport` + `HidD_GetInputReport` 直读电量与充电状态） |
+
+_更多设备逐步适配中_
 
 ---
 
@@ -93,16 +106,6 @@ flowchart TD
 4. **`Sources/BatteryIslandView.cs`（自适应高度与布局对齐）**：
    - 收起态展示最告急的 1 台设备；悬停展开态复用同一套 `DeviceRow` 布局，并根据实际可见设备数量动态计算 `DesiredExpandedHeight`（上限 `152 DIP`，与官方「硬件监控」插件严丝合缝对齐）。
 
-
----
-
-## 数据来源与已支持设备
-
-| 品牌 / 类别 | 型号 / 范围 | VID : PID | 协议通道与读取方式 |
-| --- | --- | --- | --- |
-| **蓝牙 / BLE** | 任意蓝牙耳机 / 手机 / 手柄 / 键鼠 | 任意 | Windows PnP 电池属性 `{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2` + WinRT AEP 在线过滤 |
-| **VXE / ATK** | Mouse 1K Dongle（R1SE+ 等 COMPX 接收器） | `3554:F58E` / `373B:*` | HID `UsagePage 0xFF02, Usage 0x0002`（17 字节 COMPX 协议，ReportId `0x08`：`cmd 0x03` 判在线 + `cmd 0x04` 直读电量/充电/电压） |
-| **MCHOSE 迈从** | G87 V2 等 GLW 方案 2.4G 键盘接收器 | `3837:3033` / `41E4:*` | HID `UsagePage 0x0001, Usage 0x0000`（65 字节 GLW 协议，ReportId `0x00`，`flag 0x55`，`cmd 0x05 getFuncConfig` 直读电量/充电/模式；非 GLW 旧设备回退 HUB 缓存） |
 
 ---
 

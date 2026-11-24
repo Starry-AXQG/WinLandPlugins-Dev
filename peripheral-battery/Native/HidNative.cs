@@ -83,6 +83,12 @@ internal static class HidNative
     [DllImport("hid.dll", SetLastError = true)]
     private static extern bool HidD_GetFeature(SafeFileHandle h, byte[] buffer, int length);
 
+    [DllImport("hid.dll", SetLastError = true)]
+    private static extern bool HidD_GetInputReport(SafeFileHandle h, byte[] buffer, int length);
+
+    [DllImport("hid.dll", SetLastError = true)]
+    private static extern bool HidD_SetOutputReport(SafeFileHandle h, byte[] buffer, int length);
+
     [DllImport("hid.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool HidD_GetProductString(SafeFileHandle h, byte[] buffer, int length);
 
@@ -355,6 +361,87 @@ internal static class HidNative
         finally
         {
             handle.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 通过控制管道或中断管道发送 Output Report，延时后通过 <c>HidD_GetInputReport</c>（USB 控制端点 GET_REPORT(Input)）
+    /// 轮询读取指定 <paramref name="responseReportId"/> 的响应帧。
+    /// 适用于雷柏（Rapoo）VT9PRO / V2M 等不在中断 IN 端点推送响应、而是通过控制传输读取 Input Report 的外设。
+    /// </summary>
+    internal static byte[]? TransactControlInput(
+        string path,
+        byte[] request,
+        byte responseReportId,
+        int responseLength,
+        bool preferControlOutput,
+        Func<byte[], bool>? isReady = null,
+        int initialDelayMs = 50,
+        int retryDelayMs = 50,
+        int maxAttempts = 3)
+    {
+        if (request.Length == 0 || responseLength <= 0 || responseLength > 4096) return null;
+
+        using var handle = CreateFile(
+            path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            0,
+            IntPtr.Zero);
+
+        if (handle.IsInvalid) return null;
+
+        try
+        {
+            bool sent;
+            if (preferControlOutput)
+            {
+                sent = HidD_SetOutputReport(handle, request, request.Length)
+                       || (WriteFile(handle, request, request.Length, out var w1, IntPtr.Zero) && w1 > 0);
+            }
+            else
+            {
+                sent = (WriteFile(handle, request, request.Length, out var w2, IntPtr.Zero) && w2 > 0)
+                       || HidD_SetOutputReport(handle, request, request.Length);
+            }
+
+            if (!sent) return null;
+
+            if (initialDelayMs > 0)
+            {
+                System.Threading.Thread.Sleep(initialDelayMs);
+            }
+
+            byte[]? lastBuffer = null;
+            var attempts = Math.Clamp(maxAttempts, 1, 8);
+            for (var i = 0; i < attempts; i++)
+            {
+                var buffer = new byte[responseLength];
+                buffer[0] = responseReportId;
+                if (!HidD_GetInputReport(handle, buffer, buffer.Length))
+                {
+                    return lastBuffer;
+                }
+
+                lastBuffer = buffer;
+                if (isReady is null || isReady(buffer))
+                {
+                    return buffer;
+                }
+
+                if (i + 1 < attempts && retryDelayMs > 0)
+                {
+                    System.Threading.Thread.Sleep(retryDelayMs);
+                }
+            }
+
+            return lastBuffer;
+        }
+        catch
+        {
+            return null;
         }
     }
 

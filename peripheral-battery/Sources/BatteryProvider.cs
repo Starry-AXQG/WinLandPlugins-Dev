@@ -141,6 +141,7 @@ internal sealed class BatteryProvider
     {
         var score = item.Link switch
         {
+            PeripheralLink.Wired => 35,
             PeripheralLink.Usb24G => 30,
             PeripheralLink.BluetoothLE => 20,
             PeripheralLink.Bluetooth => 10,

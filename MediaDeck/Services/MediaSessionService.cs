@@ -80,6 +80,7 @@ public sealed class MediaSessionService : IDisposable
     private readonly ConcurrentDictionary<string, byte[]?> _exeIconCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, FallbackClock> _fallbackClocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, (string Title, string Artist, string Album, byte[]? Thumb)> _smtcLastGoodProps = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (int Pid, string? ExePath, long CachedAtTicks)> _procLookupCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _smtcErrorLogThrottle = new(StringComparer.OrdinalIgnoreCase);
 
     // 稳定的有序实例表与播放状态记忆
@@ -604,6 +605,20 @@ public sealed class MediaSessionService : IDisposable
             cur.HasAppsFolderEntry);
     }
 
+    public bool MinimizeCurrentSourceWindow(string? instanceId = null)
+    {
+        var cur = GetInstanceById(instanceId);
+        if (cur is null) return false;
+        if (cur.PotPlayerHwnd != IntPtr.Zero)
+        {
+            return PolicyConfigInterop.MinimizeWindowHandle(cur.PotPlayerHwnd);
+        }
+        return PolicyConfigInterop.MinimizeWindowByProcessIdOrName(
+            cur.ProcessId,
+            cur.SourceAppId,
+            cur.SourceDisplayName);
+    }
+
     private async Task<MediaInstanceInfo?> BuildSmtcInfoAsync(
         GlobalSystemMediaTransportControlsSession session,
         string stableId,
@@ -653,7 +668,17 @@ public sealed class MediaSessionService : IDisposable
         var resolved = await GetOrResolveAppsFolderAsync(appId).ConfigureAwait(false);
 
         byte[]? thumbBytes = null;
-        if (props?.Thumbnail is not null)
+        // 曲目未发生变化且已有封面字节缓存时直接复用同一 byte[] 引用，避免每 1.5s 重复读流与触发 UI 重复解码/取色
+        if (!string.IsNullOrWhiteSpace(title) &&
+            _smtcLastGoodProps.TryGetValue(stableId, out var sameTrackCached) &&
+            sameTrackCached.Thumb is not null &&
+            string.Equals(sameTrackCached.Title, title, StringComparison.Ordinal) &&
+            string.Equals(sameTrackCached.Artist, artist, StringComparison.Ordinal) &&
+            string.Equals(sameTrackCached.Album, album, StringComparison.Ordinal))
+        {
+            thumbBytes = sameTrackCached.Thumb;
+        }
+        else if (props?.Thumbnail is not null)
         {
             try
             {
@@ -723,13 +748,7 @@ public sealed class MediaSessionService : IDisposable
         IntPtr hwnd = PolicyConfigInterop.FindMainWindowForProcessGroup(ms.ProcessId, ms.ProcessName);
         string rawTitle = hwnd != IntPtr.Zero ? PolicyConfigInterop.GetWindowTitle(hwnd) : "";
 
-        string? exePath = null;
-        try
-        {
-            using var proc = Process.GetProcessById(ms.ProcessId);
-            exePath = proc.MainModule?.FileName;
-        }
-        catch { }
+        string? exePath = PolicyConfigInterop.TryGetProcessImagePath(ms.ProcessId);
 
         var iconBytes = ms.AppIconBytes ?? await GetOrLoadExeIconAsync(ms.ProcessName, exePath).ConfigureAwait(false);
         string id = $"fallback:{ms.ProcessName}";
@@ -842,8 +861,23 @@ public sealed class MediaSessionService : IDisposable
         return bytes;
     }
 
-    private static void TryFindProcessInfo(string hint, string displayName, out int pid, out string? exePath)
+    private void TryFindProcessInfo(string hint, string displayName, out int pid, out string? exePath)
     {
+        string cacheKey = $"{hint}||{displayName}";
+        long nowTicks = DateTimeOffset.UtcNow.UtcTicks;
+        if (_procLookupCache.TryGetValue(cacheKey, out var cached) &&
+            cached.Pid > 0 &&
+            (nowTicks - cached.CachedAtTicks) < TimeSpan.FromSeconds(15).Ticks)
+        {
+            var alivePath = PolicyConfigInterop.TryGetProcessImagePath(cached.Pid);
+            if (!string.IsNullOrWhiteSpace(alivePath))
+            {
+                pid = cached.Pid;
+                exePath = cached.ExePath ?? alivePath;
+                return;
+            }
+        }
+
         pid = 0;
         exePath = null;
 
@@ -866,12 +900,17 @@ public sealed class MediaSessionService : IDisposable
                     try
                     {
                         if (pid == 0) pid = p.Id;
-                        if (exePath is null) exePath = p.MainModule?.FileName;
+                        exePath ??= PolicyConfigInterop.TryGetProcessImagePath(p.Id);
+                        if (pid != 0 && exePath is not null) break;
                     }
                     catch { }
                     finally { p.Dispose(); }
                 }
-                if (pid != 0) return;
+                if (pid != 0)
+                {
+                    _procLookupCache[cacheKey] = (pid, exePath, nowTicks);
+                    return;
+                }
             }
             catch { }
         }

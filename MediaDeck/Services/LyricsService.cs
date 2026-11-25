@@ -8,9 +8,21 @@ using Microsoft.Win32;
 
 namespace MediaDeck.Services;
 
-public sealed record LyricLine(TimeSpan Time, string Text);
+public sealed record LyricLine(
+    TimeSpan Time,
+    string Text,
+    string? Translation = null,
+    string? Romanization = null);
 
-public sealed record LyricTriplet(string Previous, string Current, string Next, bool HasSyncedLyrics);
+public sealed record LyricTriplet(
+    string Previous,
+    string Current,
+    string Next,
+    bool HasSyncedLyrics,
+    string CurrentTranslation = "",
+    string CurrentRomanization = "",
+    string CompactLine = "",
+    string RawTranslation = "");
 
 /// <summary>
 /// 同步歌词获取与匹配服务：
@@ -77,52 +89,68 @@ public sealed partial class LyricsService : IDisposable
         {
             try
             {
-                string? lrc = null;
+                List<LyricLine>? parsed = null;
+                string? rawSingleLrc = null;
 
                 // 1) 若已有精确本地音频文件路径（如 PotPlayer WM_USER 0x6020 直读），直接读取该文件的同目录 .lrc / FLAC 内嵌歌词
                 if (!string.IsNullOrWhiteSpace(localFilePath) && File.Exists(localFilePath))
                 {
-                    lrc = TryReadLocalLyricsForFile(localFilePath, title);
-                    if (!string.IsNullOrWhiteSpace(lrc))
+                    rawSingleLrc = TryReadLocalLyricsForFile(localFilePath, title);
+                    if (!string.IsNullOrWhiteSpace(rawSingleLrc))
                     {
                         _log($"已直读本地歌词：{Path.GetFileName(localFilePath)}");
+                        parsed = ParseSingleSourceLrc(rawSingleLrc);
                     }
                 }
                 else if (!string.IsNullOrWhiteSpace(sourceAppId) &&
                          sourceAppId.Contains("PotPlayer", StringComparison.OrdinalIgnoreCase))
                 {
-                    lrc = TryReadPotPlayerLocalLyrics(title, artist);
-                    if (!string.IsNullOrWhiteSpace(lrc))
+                    rawSingleLrc = TryReadPotPlayerLocalLyrics(title, artist);
+                    if (!string.IsNullOrWhiteSpace(rawSingleLrc))
                     {
                         _log($"已加载 PotPlayer 本地歌词：{title}");
+                        parsed = ParseSingleSourceLrc(rawSingleLrc);
                     }
                 }
 
-                // 2) 网易云精准 songId
-                if (string.IsNullOrWhiteSpace(lrc) && !string.IsNullOrWhiteSpace(neteaseSongId))
+                // 2) 网易云精准 songId（同时拉取原文 lrc + 外文翻译 tlyric + 外文音译 romalrc）
+                if ((parsed is null || parsed.Count == 0) && !string.IsNullOrWhiteSpace(neteaseSongId))
                 {
-                    lrc = await FetchFromNetEaseByIdAsync(neteaseSongId).ConfigureAwait(false);
+                    parsed = await FetchBundleFromNetEaseByIdAsync(neteaseSongId).ConfigureAwait(false);
                 }
 
                 // 3) 清洗歌名/歌手后进行带时长与标题校验的在线匹配
-                if (string.IsNullOrWhiteSpace(lrc))
+                if (parsed is null || parsed.Count == 0)
                 {
                     var (cleanTitle, cleanArtist) = NormalizeTitleAndArtist(title, artist);
-                    lrc = await FetchFromNetEaseAsync(cleanTitle, cleanArtist, duration).ConfigureAwait(false)
-                          ?? await FetchFromLrclibAsync(cleanTitle, cleanArtist, duration).ConfigureAwait(false);
+                    parsed = await FetchBundleFromNetEaseAsync(cleanTitle, cleanArtist, duration).ConfigureAwait(false);
+                    if (parsed is null || parsed.Count == 0)
+                    {
+                        var lrclib = await FetchFromLrclibAsync(cleanTitle, cleanArtist, duration).ConfigureAwait(false);
+                        if (!string.IsNullOrWhiteSpace(lrclib))
+                        {
+                            parsed = ParseSingleSourceLrc(lrclib);
+                        }
+                    }
 
                     // 若歌名形如 "曲名 - 歌手" 而此前按 "歌手 - 曲名" 拆分未命中，尝试反转再匹配一次
-                    if (string.IsNullOrWhiteSpace(lrc) &&
+                    if ((parsed is null || parsed.Count == 0) &&
                         string.IsNullOrWhiteSpace(artist) &&
                         !string.IsNullOrWhiteSpace(cleanArtist))
                     {
-                        lrc = await FetchFromNetEaseAsync(cleanArtist, cleanTitle, duration).ConfigureAwait(false)
-                              ?? await FetchFromLrclibAsync(cleanArtist, cleanTitle, duration).ConfigureAwait(false);
+                        parsed = await FetchBundleFromNetEaseAsync(cleanArtist, cleanTitle, duration).ConfigureAwait(false);
+                        if (parsed is null || parsed.Count == 0)
+                        {
+                            var lrclibRev = await FetchFromLrclibAsync(cleanArtist, cleanTitle, duration).ConfigureAwait(false);
+                            if (!string.IsNullOrWhiteSpace(lrclibRev))
+                            {
+                                parsed = ParseSingleSourceLrc(lrclibRev);
+                            }
+                        }
                     }
                 }
 
-                var parsed = string.IsNullOrWhiteSpace(lrc) ? [] : ParseLrc(lrc);
-                _cache[key] = parsed;
+                _cache[key] = parsed ?? [];
                 onLoaded();
             }
             catch (Exception ex)
@@ -477,11 +505,12 @@ public sealed partial class LyricsService : IDisposable
         return (title, artist);
     }
 
-    private async Task<string?> FetchFromNetEaseByIdAsync(string songId)
+    private async Task<List<LyricLine>?> FetchBundleFromNetEaseByIdAsync(string songId)
     {
         try
         {
-            var lyricUrl = $"https://music.163.com/api/song/lyric?id={Uri.EscapeDataString(songId)}&lv=1&kv=1&tv=-1";
+            // lv=-1 原文歌词，tv=-1 外文中文翻译（tlyric），rv=-1 外文罗马音/音译（romalrc）
+            var lyricUrl = $"https://music.163.com/api/song/lyric?id={Uri.EscapeDataString(songId)}&lv=-1&kv=-1&tv=-1&rv=-1";
             using var lrcReq = new HttpRequestMessage(HttpMethod.Get, lyricUrl);
             lrcReq.Headers.Referrer = new Uri("https://music.163.com/");
 
@@ -490,17 +519,28 @@ public sealed partial class LyricsService : IDisposable
 
             var lrcJson = await lrcResp.Content.ReadAsStringAsync().ConfigureAwait(false);
             using var lrcDoc = JsonDocument.Parse(lrcJson);
-            if (lrcDoc.RootElement.TryGetProperty("lrc", out var lrcObj) &&
-                lrcObj.TryGetProperty("lyric", out var lyricProp) &&
-                lyricProp.ValueKind == JsonValueKind.String)
+            var root = lrcDoc.RootElement;
+
+            string? origText = TryReadNestedLyricString(root, "lrc");
+            if (string.IsNullOrWhiteSpace(origText) || !LrcTimestampRegex().IsMatch(origText))
             {
-                var lrcText = lyricProp.GetString();
-                if (!string.IsNullOrWhiteSpace(lrcText) && LrcTimestampRegex().IsMatch(lrcText))
-                {
-                    return lrcText;
-                }
+                return null;
             }
-            return null;
+
+            string? transText = TryReadNestedLyricString(root, "tlyric");
+            string? romaText = TryReadNestedLyricString(root, "romalrc");
+
+            var origLines = ParseLrc(origText);
+            if (origLines.Count == 0) return null;
+
+            var transLines = !string.IsNullOrWhiteSpace(transText) && LrcTimestampRegex().IsMatch(transText)
+                ? ParseLrc(transText)
+                : [];
+            var romaLines = !string.IsNullOrWhiteSpace(romaText) && LrcTimestampRegex().IsMatch(romaText)
+                ? ParseLrc(romaText)
+                : [];
+
+            return MergeMultiTrackLyrics(origLines, transLines, romaLines);
         }
         catch
         {
@@ -508,7 +548,25 @@ public sealed partial class LyricsService : IDisposable
         }
     }
 
-    public LyricTriplet GetTriplet(string title, string artist, TimeSpan position, string? localFilePath = null)
+    private static string? TryReadNestedLyricString(JsonElement root, string propName)
+    {
+        if (root.TryGetProperty(propName, out var obj) &&
+            obj.ValueKind == JsonValueKind.Object &&
+            obj.TryGetProperty("lyric", out var lyricProp) &&
+            lyricProp.ValueKind == JsonValueKind.String)
+        {
+            return lyricProp.GetString();
+        }
+        return null;
+    }
+
+    public LyricTriplet GetTriplet(
+        string title,
+        string artist,
+        TimeSpan position,
+        string? localFilePath = null,
+        bool showTranslation = true,
+        bool showRomanization = false)
     {
         if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(localFilePath))
         {
@@ -539,15 +597,40 @@ public sealed partial class LyricsService : IDisposable
             }
         }
 
-        if (idx < 0)
-        {
-            return new LyricTriplet("", lines[0].Text, lines.Count > 1 ? lines[1].Text : "", true);
-        }
-
+        int targetIdx = idx < 0 ? 0 : idx;
+        var currentEntry = lines[targetIdx];
         string prev = idx > 0 ? lines[idx - 1].Text : "";
-        string cur = lines[idx].Text;
-        string next = idx + 1 < lines.Count ? lines[idx + 1].Text : "";
-        return new LyricTriplet(prev, cur, next, true);
+        string cur = currentEntry.Text;
+        string next = targetIdx + 1 < lines.Count ? lines[targetIdx + 1].Text : "";
+
+        string rawTrans = !string.IsNullOrWhiteSpace(currentEntry.Translation)
+            ? currentEntry.Translation
+            : "";
+        string curTrans = showTranslation ? rawTrans : "";
+        string curRoma = showRomanization && !string.IsNullOrWhiteSpace(currentEntry.Romanization)
+            ? currentEntry.Romanization
+            : "";
+        string compactLine = BuildCompactLyricLine(cur, curRoma, curTrans);
+
+        return new LyricTriplet(prev, cur, next, true, curTrans, curRoma, compactLine, rawTrans);
+    }
+
+    private static string BuildCompactLyricLine(string orig, string roma, string trans)
+    {
+        if (string.IsNullOrWhiteSpace(roma) && string.IsNullOrWhiteSpace(trans))
+        {
+            return orig;
+        }
+        var sb = new StringBuilder(orig);
+        if (!string.IsNullOrWhiteSpace(roma))
+        {
+            sb.Append(" (").Append(roma).Append(')');
+        }
+        if (!string.IsNullOrWhiteSpace(trans))
+        {
+            sb.Append(" · ").Append(trans);
+        }
+        return sb.ToString();
     }
 
     private async Task<string?> FetchFromLrclibAsync(string title, string artist, TimeSpan duration)
@@ -596,7 +679,7 @@ public sealed partial class LyricsService : IDisposable
         }
     }
 
-    private async Task<string?> FetchFromNetEaseAsync(string title, string artist, TimeSpan duration)
+    private async Task<List<LyricLine>?> FetchBundleFromNetEaseAsync(string title, string artist, TimeSpan duration)
     {
         try
         {
@@ -659,7 +742,7 @@ public sealed partial class LyricsService : IDisposable
                 _durationCache[BuildCacheKey(title, artist)] = TimeSpan.FromMilliseconds(bestDurMs);
             }
 
-            return await FetchFromNetEaseByIdAsync(bestSongId.ToString()).ConfigureAwait(false);
+            return await FetchBundleFromNetEaseByIdAsync(bestSongId.ToString()).ConfigureAwait(false);
         }
         catch
         {
@@ -709,6 +792,119 @@ public sealed partial class LyricsService : IDisposable
         return score;
     }
 
+    /// <summary>
+    /// 将原文歌词与外文翻译（tlyric）、外文音译（romalrc）按最近邻时间戳（±350ms 容差）精准对齐合并。
+    /// 自动过滤网易云常见的 "//" 空翻译占位以及与原文完全一致的冗余文本。
+    /// </summary>
+    private static List<LyricLine> MergeMultiTrackLyrics(
+        List<LyricLine> orig,
+        List<LyricLine> trans,
+        List<LyricLine> roma)
+    {
+        if (orig.Count == 0) return orig;
+        if (trans.Count == 0 && roma.Count == 0) return orig;
+
+        var transArr = new string?[orig.Count];
+        var romaArr = new string?[orig.Count];
+
+        AttachSubTrackByNearestTime(orig, trans, transArr);
+        AttachSubTrackByNearestTime(orig, roma, romaArr);
+
+        var merged = new List<LyricLine>(orig.Count);
+        for (int i = 0; i < orig.Count; i++)
+        {
+            var o = orig[i];
+            string? tr = NormalizeSubLyric(transArr[i], o.Text);
+            string? ro = NormalizeSubLyric(romaArr[i], o.Text);
+            merged.Add(new LyricLine(o.Time, o.Text, tr, ro));
+        }
+        return merged;
+    }
+
+    private static void AttachSubTrackByNearestTime(List<LyricLine> orig, List<LyricLine> sub, string?[] target)
+    {
+        if (sub.Count == 0 || orig.Count == 0) return;
+        const double maxDiffMs = 350.0;
+        int searchStart = 0;
+
+        foreach (var s in sub)
+        {
+            string cleaned = s.Text.Trim();
+            if (string.IsNullOrWhiteSpace(cleaned) || cleaned == "//") continue;
+
+            while (searchStart + 1 < orig.Count &&
+                   (s.Time - orig[searchStart].Time).TotalMilliseconds > maxDiffMs)
+            {
+                searchStart++;
+            }
+
+            int bestIdx = -1;
+            double bestDiff = maxDiffMs;
+            for (int i = searchStart; i < orig.Count; i++)
+            {
+                double diff = Math.Abs((orig[i].Time - s.Time).TotalMilliseconds);
+                if (diff <= bestDiff)
+                {
+                    bestDiff = diff;
+                    bestIdx = i;
+                }
+                else if (orig[i].Time > s.Time && diff > maxDiffMs)
+                {
+                    break;
+                }
+            }
+
+            if (bestIdx >= 0 && string.IsNullOrWhiteSpace(target[bestIdx]))
+            {
+                target[bestIdx] = cleaned;
+            }
+        }
+    }
+
+    private static string? NormalizeSubLyric(string? sub, string orig)
+    {
+        if (string.IsNullOrWhiteSpace(sub)) return null;
+        string s = sub.Trim();
+        if (s == "//" || string.Equals(s, orig.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        return s;
+    }
+
+    /// <summary>
+    /// 解析单一 LRC 文本（本地 .lrc / FLAC 内嵌 / LRCLIB），自动识别同时间戳双行双语歌词（第 1 行原文、第 2 行翻译）。
+    /// </summary>
+    public static List<LyricLine> ParseSingleSourceLrc(string lrcContent)
+    {
+        var raw = ParseLrc(lrcContent);
+        if (raw.Count <= 1) return raw;
+
+        var result = new List<LyricLine>(raw.Count);
+        int i = 0;
+        while (i < raw.Count)
+        {
+            var cur = raw[i];
+            if (i + 1 < raw.Count && Math.Abs((raw[i + 1].Time - cur.Time).TotalMilliseconds) <= 20.0)
+            {
+                string? trans = NormalizeSubLyric(raw[i + 1].Text, cur.Text);
+                result.Add(new LyricLine(cur.Time, cur.Text, trans, null));
+                i += 2;
+                // 若存在同一时间戳的第 3 行，跳过多余重复行
+                while (i < raw.Count && Math.Abs((raw[i].Time - cur.Time).TotalMilliseconds) <= 20.0)
+                {
+                    i++;
+                }
+            }
+            else
+            {
+                result.Add(cur);
+                i++;
+            }
+        }
+        return result;
+    }
+
     public static List<LyricLine> ParseLrc(string lrcContent)
     {
         var list = new List<LyricLine>();
@@ -740,8 +936,8 @@ public sealed partial class LyricsService : IDisposable
             }
         }
 
-        list.Sort((a, b) => a.Time.CompareTo(b.Time));
-        return list;
+        // 保持同时间戳原始先后顺序（稳定排序），确保本地双语 LRC「第 1 行原文、第 2 行翻译」不颠倒
+        return list.OrderBy(x => x.Time).ToList();
     }
 
     public void Dispose() => _http.Dispose();

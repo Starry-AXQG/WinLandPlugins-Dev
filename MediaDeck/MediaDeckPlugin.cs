@@ -53,6 +53,7 @@ public sealed class MediaDeckPlugin : IslandPluginBase
             () => (_audioService.MasterVolumePercent, _audioService.MasterMuted));
         ApplyVisualEffectSetting();
         ApplyCursorGlowSetting();
+        ApplyCompactLyricsSetting();
 
         // 启动时预先构造聚光卡视图树，首次点击秒开
         _spotlightView = CreateSpotlightView();
@@ -71,6 +72,7 @@ public sealed class MediaDeckPlugin : IslandPluginBase
                 });
             }
         };
+        _view.MinimizeSourceRequested += () => _mediaService.MinimizeCurrentSourceWindow();
         _view.PlayPauseRequested += () => _ = _mediaService.TogglePlayPauseAsync();
         _view.PreviousRequested += () => _ = _mediaService.PreviousAsync();
         _view.NextRequested += () => _ = _mediaService.NextAsync();
@@ -204,7 +206,21 @@ public sealed class MediaDeckPlugin : IslandPluginBase
             _mediaService.EnableFallbackPlayers = Settings.Get("fallback_players", true);
             _ = _mediaService.RefreshAsync();
         }));
-        Context.Register(Context.OnSettingsChanged("lyrics_enabled", () => RunOnUI(RenderMediaSnapshot)));
+        foreach (var key in new[]
+        {
+            "lyrics_enabled",
+            "lyrics_show_translation",
+            "lyrics_show_romanization",
+            "lyrics_compact_only_translation",
+            "lyrics_compact_two_lines",
+        })
+        {
+            Context.Register(Context.OnSettingsChanged(key, () => RunOnUI(() =>
+            {
+                ApplyCompactLyricsSetting();
+                RenderMediaSnapshot();
+            })));
+        }
         Context.Register(Context.OnSettingsChanged("spotlight_compact_view", () =>
         {
             RunOnUI(() => _spotlightView?.SetCompactView(Settings.Get("spotlight_compact_view", false)));
@@ -261,7 +277,7 @@ public sealed class MediaDeckPlugin : IslandPluginBase
 
         if (_tickCount % 3 == 0)
         {
-            _ = _mediaService.RefreshAsync();
+            _ = Task.Run(() => _mediaService.RefreshAsync());
         }
 
         RenderMediaSnapshot();
@@ -360,12 +376,14 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         var current = _mediaService.CurrentInstance;
         var compact = _mediaService.CompactInstance;
         bool lyricsOn = Settings.Get("lyrics_enabled", true);
+        bool showTrans = Settings.Get("lyrics_show_translation", true);
+        bool showRoma = Settings.Get("lyrics_show_romanization", false);
 
-        var triplet = ResolveLyricsTriplet(current, lyricsOn);
+        var triplet = ResolveLyricsTriplet(current, lyricsOn, showTrans, showRoma);
         var compactTriplet = compact is not null && current is not null &&
                              string.Equals(compact.Id, current.Id, StringComparison.OrdinalIgnoreCase)
             ? triplet
-            : ResolveLyricsTriplet(compact, lyricsOn);
+            : ResolveLyricsTriplet(compact, lyricsOn, showTrans, showRoma);
 
         _view.UpdateMedia(current, _mediaService.Instances.Count, _mediaService.SelectedIndex, triplet, compact, compactTriplet);
         _view.UpdateSleepTimer(_sleepTimer.IsActive(current?.Id), _sleepTimer.GetRemaining(current?.Id));
@@ -375,16 +393,18 @@ public sealed class MediaDeckPlugin : IslandPluginBase
     private IReadOnlyList<(MediaInstanceInfo Info, LyricTriplet Lyrics)> BuildAllMediaSnapshots()
     {
         bool lyricsOn = Settings.Get("lyrics_enabled", true);
+        bool showTrans = Settings.Get("lyrics_show_translation", true);
+        bool showRoma = Settings.Get("lyrics_show_romanization", false);
         var list = _mediaService.Instances;
         var result = new List<(MediaInstanceInfo, LyricTriplet)>(list.Count);
         foreach (var inst in list)
         {
-            result.Add((inst, ResolveLyricsTriplet(inst, lyricsOn)));
+            result.Add((inst, ResolveLyricsTriplet(inst, lyricsOn, showTrans, showRoma)));
         }
         return result;
     }
 
-    private LyricTriplet ResolveLyricsTriplet(MediaInstanceInfo? inst, bool lyricsOn)
+    private LyricTriplet ResolveLyricsTriplet(MediaInstanceInfo? inst, bool lyricsOn, bool showTrans, bool showRoma)
     {
         if (inst is null)
         {
@@ -399,7 +419,7 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         {
             if (!_stopped) RunOnUI(RenderMediaSnapshot);
         }, inst.NetEaseSongId, inst.SourceAppId, inst.LocalFilePath);
-        return _lyricsService.GetTriplet(inst.Title, inst.Artist, inst.EstimatedPosition, inst.LocalFilePath);
+        return _lyricsService.GetTriplet(inst.Title, inst.Artist, inst.EstimatedPosition, inst.LocalFilePath, showTrans, showRoma);
     }
 
     private (VisualEffectMode Mode, double Reactivity, bool GlowOn, double GlowSize, double GlowOpacity) ReadVisualConfig()
@@ -433,6 +453,13 @@ public sealed class MediaDeckPlugin : IslandPluginBase
         _spotlightView?.SetVisualConfig(cfg.Mode, cfg.Reactivity, cfg.GlowOn, cfg.GlowSize, cfg.GlowOpacity);
     }
 
+    private void ApplyCompactLyricsSetting()
+    {
+        bool onlyTrans = Settings.Get("lyrics_compact_only_translation", false);
+        bool twoLines = Settings.Get("lyrics_compact_two_lines", false);
+        _view.SetCompactLyricsOptions(onlyTrans, twoLines);
+    }
+
     private void RefreshDevicesOnUI()
     {
         if (_stopped) return;
@@ -464,6 +491,7 @@ public sealed class MediaDeckPlugin : IslandPluginBase
                 });
             }
         };
+        view.MinimizeSourceRequested += id => _mediaService.MinimizeCurrentSourceWindow(id);
         view.PlayPauseRequested += id => _ = _mediaService.TogglePlayPauseAsync(id);
         view.PreviousRequested += id => _ = _mediaService.PreviousAsync(id);
         view.NextRequested += id => _ = _mediaService.NextAsync(id);
@@ -661,7 +689,98 @@ public sealed class MediaDeckPlugin : IslandPluginBase
 
         panel.Children.Add(MakeToggleCard("聚光卡使用紧凑视图（关闭时分页展示：首页音频控制，第二页媒体实例）", "spotlight_compact_view", false));
         panel.Children.Add(MakeToggleCard("蓝牙耳机接入提醒", "bt_notify", true));
-        panel.Children.Add(MakeToggleCard("卡片上显示同步歌词", "lyrics_enabled", true));
+        // 同步歌词设置（标题 + 总开关 + 外文歌词多选框 + 胶囊态专属选项）
+        bool initLyricsOn = Settings.Get("lyrics_enabled", true);
+        var lyricsSectionTitle = new TextBlock
+        {
+            Text = "同步歌词设置",
+            FontSize = 14.5,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        };
+        var lyricsToggle = new ToggleSwitch
+        {
+            Header = "显示同步歌词",
+            IsOn = initLyricsOn,
+        };
+        var transCheck = new CheckBox
+        {
+            Content = "外文歌词显示翻译",
+            IsChecked = Settings.Get("lyrics_show_translation", true),
+            IsEnabled = initLyricsOn,
+            MinWidth = 190,
+        };
+        var romaCheck = new CheckBox
+        {
+            Content = "外文歌词显示音译",
+            IsChecked = Settings.Get("lyrics_show_romanization", false),
+            IsEnabled = initLyricsOn,
+            MinWidth = 190,
+        };
+        var compactOnlyTransCheck = new CheckBox
+        {
+            Content = "胶囊态仅显示歌词翻译",
+            IsChecked = Settings.Get("lyrics_compact_only_translation", false),
+            IsEnabled = initLyricsOn,
+            MinWidth = 190,
+        };
+        var compactTwoLinesCheck = new CheckBox
+        {
+            Content = "允许胶囊态双行显示歌词",
+            IsChecked = Settings.Get("lyrics_compact_two_lines", false),
+            IsEnabled = initLyricsOn,
+            MinWidth = 190,
+        };
+
+        bool loadingLyrics = true;
+        lyricsToggle.Toggled += (_, _) =>
+        {
+            if (loadingLyrics) return;
+            bool on = lyricsToggle.IsOn;
+            transCheck.IsEnabled = on;
+            romaCheck.IsEnabled = on;
+            compactOnlyTransCheck.IsEnabled = on;
+            compactTwoLinesCheck.IsEnabled = on;
+            Settings.Set("lyrics_enabled", on);
+        };
+        transCheck.Checked += (_, _) => { if (!loadingLyrics) Settings.Set("lyrics_show_translation", true); };
+        transCheck.Unchecked += (_, _) => { if (!loadingLyrics) Settings.Set("lyrics_show_translation", false); };
+        romaCheck.Checked += (_, _) => { if (!loadingLyrics) Settings.Set("lyrics_show_romanization", true); };
+        romaCheck.Unchecked += (_, _) => { if (!loadingLyrics) Settings.Set("lyrics_show_romanization", false); };
+        compactOnlyTransCheck.Checked += (_, _) => { if (!loadingLyrics) Settings.Set("lyrics_compact_only_translation", true); };
+        compactOnlyTransCheck.Unchecked += (_, _) => { if (!loadingLyrics) Settings.Set("lyrics_compact_only_translation", false); };
+        compactTwoLinesCheck.Checked += (_, _) => { if (!loadingLyrics) Settings.Set("lyrics_compact_two_lines", true); };
+        compactTwoLinesCheck.Unchecked += (_, _) => { if (!loadingLyrics) Settings.Set("lyrics_compact_two_lines", false); };
+        loadingLyrics = false;
+
+        var lyricsCheckRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 24,
+            Children = { transCheck, romaCheck },
+        };
+        var compactSubLabel = new TextBlock
+        {
+            Text = "胶囊形态专属选项",
+            FontSize = 12,
+            Opacity = 0.70,
+            Margin = new Thickness(0, 4, 0, -2),
+        };
+        var compactCheckRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 24,
+            Children = { compactOnlyTransCheck, compactTwoLinesCheck },
+        };
+        var lyricsStack = new StackPanel
+        {
+            Spacing = 8,
+            Children = { lyricsSectionTitle, lyricsToggle, lyricsCheckRow, compactSubLabel, compactCheckRow },
+        };
+        panel.Children.Add(new Border
+        {
+            Style = (Style)Application.Current.Resources["SettingsCardStyle"],
+            Child = lyricsStack,
+        });
         panel.Children.Add(MakeToggleCard("兼容未接入系统媒体控制的播放器（如网易云音乐）", "fallback_players", true));
 
         // ---- 动态优先级设置区 ----

@@ -80,3 +80,15 @@ E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\obj\Release\net10.0-
 E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\obj\Release\net10.0-windows10.0.26100.0\win-x64\qualifiers.txt.intermediate
 E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\obj\Release\net10.0-windows10.0.26100.0\win-x64\MultipleQualifiersPerDimensionFound.txt
 E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\logo.png
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\1_胶囊态-轮廓光效果静态演示.png
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\2_胶囊态-波浪效果静态演示.png
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\3_卡片态-轮廓光效果静态演示.png
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\4_卡片态-波浪效果静态演示.png
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\聚光卡-截图演示 (1).png
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\聚光卡-截图演示 (2).png
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\聚光卡-截图演示 (3).png
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\gif\卡片态-波浪效果播放演示.gif
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\gif\卡片态-轮廓光效果播放演示.gif
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\gif\插件的交互设计演示 .gif
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\gif\胶囊态-波浪效果-动画演示.gif
+E:\100 - 🏗️ 项目\Github\WinLandPlugins-Dev\MediaDeck\bin\Release\net10.0-windows10.0.26100.0\win-x64\MediaDeck\previews\gif\胶囊态-轮廓光效果-动画演示.gif

@@ -135,6 +135,8 @@ public sealed class SpotlightMediaCard : UserControl
     private readonly TextBlock _sourceNameText;
     private readonly TextBlock _lyricPrev;
     private readonly TextBlock _lyricCurr;
+    private readonly TextBlock _lyricCurrRoma;
+    private readonly TextBlock _lyricCurrTrans;
     private readonly TextBlock _lyricNext;
     private readonly Button _prevBtn;
     private readonly Button _nextBtn;
@@ -165,10 +167,13 @@ public sealed class SpotlightMediaCard : UserControl
     private byte[]? _lastAppIconBytes;
     private string _sourceName = "媒体播放器";
     private bool _isPlaying;
+    private readonly Microsoft.UI.Dispatching.DispatcherQueueTimer? _sourceClickTimer;
+    private DateTimeOffset _lastSourceClickAt = DateTimeOffset.MinValue;
 
     public string InstanceId => _instanceId;
 
     public event Action<string>? ActivateSourceRequested;
+    public event Action<string>? MinimizeSourceRequested;
     public event Action<string>? PlayPauseRequested;
     public event Action<string>? PreviousRequested;
     public event Action<string>? NextRequested;
@@ -292,10 +297,54 @@ public sealed class SpotlightMediaCard : UserControl
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
         };
+        _sourceClickTimer = DispatcherQueue?.CreateTimer();
+        if (_sourceClickTimer is not null)
+        {
+            _sourceClickTimer.Interval = TimeSpan.FromMilliseconds(220);
+            _sourceClickTimer.IsRepeating = false;
+            _sourceClickTimer.Tick += (_, _) =>
+            {
+                _lastSourceClickAt = DateTimeOffset.MinValue;
+                ActivateSourceRequested?.Invoke(_instanceId);
+            };
+        }
+
         var sourceBtn = CreateIconButton(new Grid { Children = { _sourceIconFallback, _sourceIconImg } }, 28, 26, 8, false);
         sourceBtn.HorizontalAlignment = HorizontalAlignment.Left;
-        sourceBtn.Click += (_, _) => ActivateSourceRequested?.Invoke(_instanceId);
-        _attachHint(sourceBtn, () => $"切换至 {_sourceName}");
+        sourceBtn.AddHandler(PointerPressedEvent, new PointerEventHandler((_, e) =>
+        {
+            var props = e.GetCurrentPoint(sourceBtn).Properties;
+            if (props.IsMiddleButtonPressed || props.PointerUpdateKind == Microsoft.UI.Input.PointerUpdateKind.MiddleButtonPressed)
+            {
+                e.Handled = true;
+                _sourceClickTimer?.Stop();
+                _lastSourceClickAt = DateTimeOffset.MinValue;
+                MinimizeSourceRequested?.Invoke(_instanceId);
+            }
+        }), handledEventsToo: true);
+        sourceBtn.Click += (_, _) =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            if ((now - _lastSourceClickAt).TotalMilliseconds <= 280)
+            {
+                _sourceClickTimer?.Stop();
+                _lastSourceClickAt = DateTimeOffset.MinValue;
+                MinimizeSourceRequested?.Invoke(_instanceId);
+                return;
+            }
+
+            _lastSourceClickAt = now;
+            if (_sourceClickTimer is not null)
+            {
+                _sourceClickTimer.Stop();
+                _sourceClickTimer.Start();
+            }
+            else
+            {
+                ActivateSourceRequested?.Invoke(_instanceId);
+            }
+        };
+        _attachHint(sourceBtn, () => $"切换至 {_sourceName}\n若窗口已打开，可双击或中键来收回窗口");
 
         _statusPillText = new TextBlock
         {
@@ -387,6 +436,7 @@ public sealed class SpotlightMediaCard : UserControl
             Foreground = _faintBrush,
             TextAlignment = TextAlignment.Center,
             TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(0, 0, 0, 4),
         };
         _lyricCurr = new TextBlock
         {
@@ -399,6 +449,28 @@ public sealed class SpotlightMediaCard : UserControl
             MaxLines = 2,
             TextTrimming = TextTrimming.CharacterEllipsis,
         };
+        _lyricCurrRoma = new TextBlock
+        {
+            Text = "",
+            FontSize = 10.5,
+            Foreground = _mutedBrush,
+            TextAlignment = TextAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            MaxLines = 1,
+            Height = 0,
+            Opacity = 0,
+        };
+        _lyricCurrTrans = new TextBlock
+        {
+            Text = "",
+            FontSize = 11,
+            Foreground = _mutedBrush,
+            TextAlignment = TextAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            MaxLines = 1,
+            Height = 0,
+            Opacity = 0,
+        };
         _lyricNext = new TextBlock
         {
             Text = "",
@@ -406,14 +478,15 @@ public sealed class SpotlightMediaCard : UserControl
             Foreground = _faintBrush,
             TextAlignment = TextAlignment.Center,
             TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(0, 4, 0, 0),
         };
 
         var middleRight = new StackPanel
         {
-            Spacing = 4,
+            Spacing = 0,
             VerticalAlignment = VerticalAlignment.Center,
             Padding = new Thickness(12, 0, 4, 0),
-            Children = { _lyricPrev, _lyricCurr, _lyricNext },
+            Children = { _lyricPrev, _lyricCurr, _lyricCurrRoma, _lyricCurrTrans, _lyricNext },
         };
 
         var middleGrid = new Grid { Margin = new Thickness(0, 2, 0, 2) };
@@ -712,9 +785,7 @@ public sealed class SpotlightMediaCard : UserControl
             _statusPillText.Text = "已暂停";
         }
 
-        _lyricPrev.Text = lyrics.Previous;
-        _lyricCurr.Text = string.IsNullOrWhiteSpace(lyrics.Current) ? "暂无同步歌词" : lyrics.Current;
-        _lyricNext.Text = lyrics.Next;
+        ApplyCardLyrics(lyrics);
 
         if (!_isSeeking)
         {
@@ -732,6 +803,35 @@ public sealed class SpotlightMediaCard : UserControl
         UpdateTimerDisplay(hasTimer, timerRemaining);
         UpdateCoverImage(info.ThumbnailBytes, force: trackChanged);
         UpdateAppIconImage(info.AppIconBytes);
+    }
+
+    private void ApplyCardLyrics(LyricTriplet lyrics)
+    {
+        bool hasRoma = !string.IsNullOrWhiteSpace(lyrics.CurrentRomanization);
+        bool hasTrans = !string.IsNullOrWhiteSpace(lyrics.CurrentTranslation);
+        bool hasAnySub = hasRoma || hasTrans;
+        bool hasBothSub = hasRoma && hasTrans;
+
+        _lyricPrev.Text = lyrics.Previous;
+        _lyricPrev.Height = hasBothSub ? 0 : double.NaN;
+        _lyricPrev.Opacity = hasBothSub ? 0 : 1;
+        _lyricPrev.Margin = hasBothSub ? new Thickness(0) : new Thickness(0, 0, 0, hasAnySub ? 2.5 : 4);
+
+        _lyricCurr.Text = string.IsNullOrWhiteSpace(lyrics.Current) ? "暂无同步歌词" : lyrics.Current;
+        _lyricCurr.MaxLines = hasAnySub ? 1 : 2;
+
+        _lyricCurrRoma.Text = hasRoma ? lyrics.CurrentRomanization : "";
+        _lyricCurrRoma.Height = hasRoma ? double.NaN : 0;
+        _lyricCurrRoma.Opacity = hasRoma ? 1 : 0;
+        _lyricCurrRoma.Margin = hasRoma ? new Thickness(0, 1.5, 0, 0) : new Thickness(0);
+
+        _lyricCurrTrans.Text = hasTrans ? lyrics.CurrentTranslation : "";
+        _lyricCurrTrans.Height = hasTrans ? double.NaN : 0;
+        _lyricCurrTrans.Opacity = hasTrans ? 1 : 0;
+        _lyricCurrTrans.Margin = hasTrans ? new Thickness(0, 1.5, 0, 0) : new Thickness(0);
+
+        _lyricNext.Text = lyrics.Next;
+        _lyricNext.Margin = new Thickness(0, hasAnySub ? 2.5 : 4, 0, 0);
     }
 
     public void UpdateTimerDisplay(bool hasTimer, TimeSpan remaining)
@@ -1048,6 +1148,8 @@ public sealed class SpotlightMediaCard : UserControl
 
     public void CloseAlarmPopup()
     {
+        _sourceClickTimer?.Stop();
+        _lastSourceClickAt = DateTimeOffset.MinValue;
         if (!_alarmPopupOpen) return;
         _alarmPopupOpen = false;
         _alarmPopup.Opacity = 0;

@@ -48,13 +48,29 @@ public sealed record SpatialSoundOption(
     bool IsSupported);
 
 /// <summary>
-/// 独立音频后台线程中枢（借鉴 EarTrumpet / SoundSwitch 架构）：
-///   - 所有 Core Audio COM 对象（MMDeviceEnumerator / AudioSessionManager / IPolicyConfig / SpatialAudio）
-///     完全隔离在独立的后台 MTA 线程中创建和调用，彻底杜绝 COM 跨套间封送回 WinUI 3 UI 线程导致的卡顿；
-///   - UI 线程只读取 volatile 不可变快照与实时电平浮点值，耗时 &lt; 0.01ms，零锁、零阻塞。
+/// 三通道分离式后台音频中枢（借鉴 EarTrumpet / SoundSwitch 架构）：
+///   1. 实时控制线程（MediaDeck.AudioControl）：独立 MTA 高优线程 + 最新状态原子合并，专门处理默认设备切换、
+///      系统主音量/静音、应用音量/静音，绝不与枚举任务同队列排队，彻底杜绝切换耳机后点静音延后数秒的队头阻塞；
+///   2. 合并式枚举线程（MediaDeck.AudioWorker）：按位合并（Coalescing）+ 60ms 通知风暴防抖，设备切换瞬间的
+///      多次系统回调自动合并为单次刷新；
+///   3. 实时电平线程（MediaDeck.AudioMeter）：33ms 轻量峰值与音量同步，UI 线程零锁读取。
 /// </summary>
 public sealed class AudioDeviceService : IDisposable
 {
+    [Flags]
+    private enum RefreshFlags
+    {
+        None = 0,
+        Devices = 1 << 0,
+        Mixer = 1 << 1,
+        Spatial = 1 << 2,
+        ForceSpatial = 1 << 3,
+        CheckNewlyActive = 1 << 4,
+        All = Devices | Mixer | Spatial,
+    }
+
+    private sealed record CachedPidMeta(string ProcessName, string? ExePath, long VerifiedAtTicks);
+
     private static readonly PropertyKey PkeyEndpointFormFactor =
         new(new Guid("1da5d803-d492-4edd-8c23-e0c0ffee7f0e"), 0);
 
@@ -65,11 +81,29 @@ public sealed class AudioDeviceService : IDisposable
         new(new Guid("026e516e-b814-414b-83cd-856d6fef4822"), 2);
 
     private readonly Action<string> _log;
-    private readonly BlockingCollection<Action> _workQueue = new();
+    private readonly AutoResetEvent _controlSignal = new(false);
+    private readonly AutoResetEvent _refreshSignal = new(false);
+    private readonly object _controlLock = new();
+    private readonly Thread _controlThread;
     private readonly Thread _audioThread;
     private readonly Thread _meterThread;
     private readonly HashSet<string> _knownActiveDeviceIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<(string DeviceId, DeviceState State)> _deviceStateEvents = new();
     private readonly ConcurrentDictionary<string, byte[]?> _mixerIconCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<int, CachedPidMeta> _pidMetaCache = new();
+    private readonly ConcurrentDictionary<int, float> _pendingSessionVolumes = new();
+    private readonly ConcurrentDictionary<int, bool> _pendingSessionMutes = new();
+
+    // 实时控制待执行状态（受 _controlLock 保护，高频触发自动合并为最新值）
+    private string? _pendingSwitchDeviceId;
+    private int? _pendingMasterVolume;
+    private bool? _pendingMasterMute;
+    private string? _pendingSpatialSubtype;
+
+    // 合并式枚举标记
+    private int _pendingRefreshFlags;
+    private long _refreshNotBeforeTicks;
+    private string? _lastSpatialDeviceId;
 
     // 仅在 _audioThread 上访问的 COM 实例
     private MMDeviceEnumerator? _enumerator;
@@ -114,7 +148,17 @@ public sealed class AudioDeviceService : IDisposable
     {
         _log = log;
 
-        // 1. 专属 Core Audio 命令与枚举线程（MTA，不与 WinUI STA 线程纠缠）
+        // 1. 专属高优实时控制线程（设备快切、静音、音量直达，零排队阻塞）
+        _controlThread = new Thread(AudioControlLoop)
+        {
+            Name = "MediaDeck.AudioControl",
+            IsBackground = true,
+            Priority = ThreadPriority.AboveNormal,
+        };
+        _controlThread.SetApartmentState(ApartmentState.MTA);
+        _controlThread.Start();
+
+        // 2. 专属合并式枚举线程（MTA，不与 WinUI STA 线程或实时控制线程抢锁）
         _audioThread = new Thread(AudioWorkerLoop)
         {
             Name = "MediaDeck.AudioWorker",
@@ -123,7 +167,7 @@ public sealed class AudioDeviceService : IDisposable
         _audioThread.SetApartmentState(ApartmentState.MTA);
         _audioThread.Start();
 
-        // 2. 轻量音频电平采样线程（每 33ms 采样一次，零 UI 阻塞）
+        // 3. 轻量音频电平采样线程（每 33ms 采样一次，零 UI 阻塞）
         _meterThread = new Thread(MeterLoop)
         {
             Name = "MediaDeck.AudioMeter",
@@ -137,28 +181,23 @@ public sealed class AudioDeviceService : IDisposable
     public (float Master, float Left, float Right) GetCurrentAudioPeak()
         => (_peakMaster, _peakLeft, _peakRight);
 
-    /// <summary>调整系统主音量（0..100），乐观更新 UI，后台异步写入 CoreAudio。</summary>
+    /// <summary>调整系统主音量（0..100），乐观更新 UI，投递至独立高优控制线程立即写入 CoreAudio。</summary>
     public int SetMasterVolume(int percent)
     {
         int clamped = Math.Clamp(percent, 0, 100);
         _masterVolumePercent = clamped;
         if (clamped > 0) _masterMuted = false;
-        Interlocked.Exchange(ref _masterVolLockUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(600).UtcTicks);
+        Interlocked.Exchange(ref _masterVolLockUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(1000).UtcTicks);
 
-        EnqueueWork(() =>
+        lock (_controlLock)
         {
-            if (_enumerator is null) return;
-            try
+            _pendingMasterVolume = clamped;
+            if (clamped > 0 && _pendingMasterMute == true)
             {
-                using var def = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                def.AudioEndpointVolume.MasterVolumeLevelScalar = clamped / 100f;
-                if (clamped > 0 && def.AudioEndpointVolume.Mute)
-                {
-                    def.AudioEndpointVolume.Mute = false;
-                }
+                _pendingMasterMute = false;
             }
-            catch { }
-        });
+        }
+        SignalControl();
         return clamped;
     }
 
@@ -166,51 +205,46 @@ public sealed class AudioDeviceService : IDisposable
     public int StepMasterVolume(int deltaPercent)
         => SetMasterVolume(_masterVolumePercent + deltaPercent);
 
-    /// <summary>切换系统主音量静音状态，乐观更新 UI 并异步写入 CoreAudio。</summary>
+    /// <summary>切换系统主音量静音状态，乐观更新 UI，投递至独立高优控制线程毫秒级写入 CoreAudio。</summary>
     public bool ToggleMasterMute()
     {
         bool nextMuted = !_masterMuted;
         _masterMuted = nextMuted;
-        Interlocked.Exchange(ref _masterVolLockUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(600).UtcTicks);
+        Interlocked.Exchange(ref _masterVolLockUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(1000).UtcTicks);
 
-        EnqueueWork(() =>
+        lock (_controlLock)
         {
-            if (_enumerator is null) return;
-            try
-            {
-                using var def = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                def.AudioEndpointVolume.Mute = nextMuted;
-            }
-            catch { }
-        });
+            _pendingMasterMute = nextMuted;
+        }
+        SignalControl();
         return nextMuted;
     }
 
-    /// <summary>向后台音频线程投递全量缓存刷新（立即返回，不阻塞调用方）。</summary>
+    /// <summary>向后台枚举线程投递合并式全量刷新（含强制空间音效重查）。</summary>
     public void RequestRefreshAll()
     {
         if (_disposed) return;
-        EnqueueWork(RefreshAllOnWorker);
+        RequestCoalescedRefresh(RefreshFlags.All | RefreshFlags.ForceSpatial, debounceMs: 0);
     }
 
-    /// <summary>向后台音频线程投递音量合成器刷新。</summary>
+    /// <summary>向后台枚举线程投递合并式音量合成器刷新（队列已有待跑任务时自动去重）。</summary>
     public void RequestRefreshMixer()
     {
         if (_disposed) return;
-        EnqueueWork(RefreshMixerOnWorker);
+        RequestCoalescedRefresh(RefreshFlags.Mixer, debounceMs: 0);
     }
 
     /// <summary>
     /// 异步切换默认音频输出设备：
-    ///   - 立即乐观更新快照并设置 1.5s 目标设备锁（防止切换 3 个 Role 期间系统中间态通知把 UI 刷回原设备）；
-    ///   - 独立高优先级线程直接调用 IPolicyConfig，不排在音量合成器枚举队列后面，消除切换延迟。
+    ///   - 立即乐观更新快照并设置 1.6s 目标设备锁；
+    ///   - 由独立高优实时控制线程直接调用 IPolicyConfig 并同步新设备真实音量/静音态，零队列积压。
     /// </summary>
     public void SwitchOutputDeviceAsync(string deviceId)
     {
         if (_disposed || string.IsNullOrWhiteSpace(deviceId)) return;
 
         _lockedTargetDeviceId = deviceId;
-        Interlocked.Exchange(ref _lockedTargetUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(1500).UtcTicks);
+        Interlocked.Exchange(ref _lockedTargetUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(1600).UtcTicks);
 
         // 乐观更新，UI 零等待
         _cachedDevices = _cachedDevices
@@ -219,22 +253,11 @@ public sealed class AudioDeviceService : IDisposable
         Interlocked.Increment(ref _devicesVersion);
         DevicesChanged?.Invoke();
 
-        _ = Task.Run(() =>
+        lock (_controlLock)
         {
-            bool ok = PolicyConfigInterop.SetDefaultAudioEndpoint(deviceId);
-            if (!ok)
-            {
-                // 失败则立刻解除锁并回刷真实设备状态
-                _lockedTargetDeviceId = null;
-                Interlocked.Exchange(ref _lockedTargetUntilTicks, 0);
-            }
-            _resetMeterFlag = true;
-            EnqueueWork(() =>
-            {
-                RefreshAllOnWorker();
-                DevicesChanged?.Invoke();
-            });
-        });
+            _pendingSwitchDeviceId = deviceId;
+        }
+        SignalControl();
     }
 
     public List<AudioDeviceInfo> GetOutputDevices() => _cachedDevices;
@@ -252,25 +275,8 @@ public sealed class AudioDeviceService : IDisposable
             .Select(s => s.ProcessId == processId ? s with { Volume = clamped, IsMuted = clamped > 0 ? false : s.IsMuted } : s)
             .ToList();
 
-        EnqueueWork(() =>
-        {
-            if (_enumerator is null) return;
-            try
-            {
-                using var def = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                var sessions = def.AudioSessionManager.Sessions;
-                for (int i = 0; i < sessions.Count; i++)
-                {
-                    var s = sessions[i];
-                    bool match = processId == 0 ? s.IsSystemSoundsSession : ((int)s.GetProcessID == processId && !s.IsSystemSoundsSession);
-                    if (match)
-                    {
-                        s.SimpleAudioVolume.Volume = clamped;
-                    }
-                }
-            }
-            catch { }
-        });
+        _pendingSessionVolumes[processId] = clamped;
+        SignalControl();
     }
 
     public void SetSessionMute(int processId, bool muted)
@@ -282,25 +288,8 @@ public sealed class AudioDeviceService : IDisposable
             .ToList();
         Interlocked.Increment(ref _mixerVersion);
 
-        EnqueueWork(() =>
-        {
-            if (_enumerator is null) return;
-            try
-            {
-                using var def = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                var sessions = def.AudioSessionManager.Sessions;
-                for (int i = 0; i < sessions.Count; i++)
-                {
-                    var s = sessions[i];
-                    bool match = processId == 0 ? s.IsSystemSoundsSession : ((int)s.GetProcessID == processId && !s.IsSystemSoundsSession);
-                    if (match)
-                    {
-                        s.SimpleAudioVolume.Mute = muted;
-                    }
-                }
-            }
-            catch { }
-        });
+        _pendingSessionMutes[processId] = muted;
+        SignalControl();
     }
 
     public void SetSpatialSoundAsync(string subtype)
@@ -314,34 +303,254 @@ public sealed class AudioDeviceService : IDisposable
         Interlocked.Increment(ref _spatialVersion);
         CacheUpdated?.Invoke();
 
-        EnqueueWork(() =>
+        lock (_controlLock)
+        {
+            _pendingSpatialSubtype = subtype ?? string.Empty;
+        }
+        SignalControl();
+    }
+
+    private void SignalControl()
+    {
+        if (_disposed) return;
+        try { _controlSignal.Set(); } catch { }
+    }
+
+    private void RequestCoalescedRefresh(RefreshFlags flags, int debounceMs)
+    {
+        if (_disposed) return;
+        Interlocked.Or(ref _pendingRefreshFlags, (int)flags);
+        if (debounceMs > 0)
+        {
+            long targetTicks = DateTimeOffset.UtcNow.AddMilliseconds(debounceMs).UtcTicks;
+            long cur = Interlocked.Read(ref _refreshNotBeforeTicks);
+            if (targetTicks > cur)
+            {
+                Interlocked.Exchange(ref _refreshNotBeforeTicks, targetTicks);
+            }
+        }
+        try { _refreshSignal.Set(); } catch { }
+    }
+
+    /// <summary>
+    /// 独立高优实时控制循环：毫秒级执行设备快切、静音与音量写入，绝不被枚举或空间音效查询阻塞。
+    /// </summary>
+    private void AudioControlLoop()
+    {
+        MMDeviceEnumerator? controlEnum = null;
+        try
+        {
+            controlEnum = new MMDeviceEnumerator();
+            while (!_disposed)
+            {
+                _controlSignal.WaitOne(500);
+                if (_disposed) break;
+
+                while (!_disposed)
+                {
+                    string? switchId;
+                    int? masterVol;
+                    bool? masterMute;
+                    string? spatialSubtype;
+
+                    lock (_controlLock)
+                    {
+                        switchId = _pendingSwitchDeviceId;
+                        _pendingSwitchDeviceId = null;
+
+                        masterVol = _pendingMasterVolume;
+                        _pendingMasterVolume = null;
+
+                        masterMute = _pendingMasterMute;
+                        _pendingMasterMute = null;
+
+                        spatialSubtype = _pendingSpatialSubtype;
+                        _pendingSpatialSubtype = null;
+                    }
+
+                    bool hasSessionWork = !_pendingSessionVolumes.IsEmpty || !_pendingSessionMutes.IsEmpty;
+                    if (switchId is null && masterVol is null && masterMute is null && spatialSubtype is null && !hasSessionWork)
+                    {
+                        break;
+                    }
+
+                    // 1) 优先执行默认音频输出设备切换
+                    if (switchId is not null)
+                    {
+                        bool ok = PolicyConfigInterop.SetDefaultAudioEndpoint(switchId);
+                        if (!ok)
+                        {
+                            _lockedTargetDeviceId = null;
+                            Interlocked.Exchange(ref _lockedTargetUntilTicks, 0);
+                        }
+                        else
+                        {
+                            // 切换成功后，若用户没有同时按下静音/调音量，立即读取新耳机/扬声器的真实音量与静音状态同步给 UI
+                            bool userOverrodeVolOrMute;
+                            lock (_controlLock)
+                            {
+                                userOverrodeVolOrMute = masterVol.HasValue || masterMute.HasValue ||
+                                                        _pendingMasterVolume.HasValue || _pendingMasterMute.HasValue;
+                            }
+                            if (!userOverrodeVolOrMute)
+                            {
+                                try
+                                {
+                                    using var targetDev = controlEnum.GetDevice(switchId);
+                                    var ep = targetDev.AudioEndpointVolume;
+                                    _masterVolumePercent = Math.Clamp((int)Math.Round(ep.MasterVolumeLevelScalar * 100f), 0, 100);
+                                    _masterMuted = ep.Mute;
+                                    Interlocked.Exchange(ref _masterVolLockUntilTicks, 0);
+                                }
+                                catch { }
+                            }
+                        }
+
+                        _resetMeterFlag = true;
+                        RequestCoalescedRefresh(RefreshFlags.All, debounceMs: 70);
+                    }
+
+                    // 2) 立即执行系统主音量 / 主静音（同时覆盖目标锁定设备与当前默认设备，杜绝设备切换过渡期漏静音）
+                    if (masterVol.HasValue || masterMute.HasValue)
+                    {
+                        ApplyMasterVolumeAndMuteImmediate(controlEnum, masterVol, masterMute);
+                        Interlocked.Exchange(ref _masterVolLockUntilTicks, DateTimeOffset.UtcNow.AddMilliseconds(650).UtcTicks);
+                    }
+
+                    // 3) 立即执行单个应用音量 / 静音
+                    if (hasSessionWork)
+                    {
+                        ApplySessionControlsImmediate(controlEnum);
+                    }
+
+                    // 4) 空间音效切换
+                    if (spatialSubtype is not null)
+                    {
+                        try
+                        {
+                            var winrtDeviceId = MediaDevice.GetDefaultAudioRenderId(AudioDeviceRole.Default);
+                            if (!string.IsNullOrWhiteSpace(winrtDeviceId))
+                            {
+                                var config = SpatialAudioDeviceConfiguration.GetForDeviceId(winrtDeviceId);
+                                config?.SetDefaultSpatialAudioFormatAsync(spatialSubtype).AsTask().GetAwaiter().GetResult();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _log($"切换空间音效失败：{ex.Message}");
+                        }
+                        finally
+                        {
+                            RequestCoalescedRefresh(RefreshFlags.Spatial | RefreshFlags.ForceSpatial, debounceMs: 0);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log($"实时音频控制线程异常：{ex.Message}");
+        }
+        finally
+        {
+            try { controlEnum?.Dispose(); } catch { }
+        }
+    }
+
+    private void ApplyMasterVolumeAndMuteImmediate(MMDeviceEnumerator controlEnum, int? vol, bool? mute)
+    {
+        string? appliedDeviceId = null;
+        var lockedId = _lockedTargetDeviceId;
+        if (!string.IsNullOrEmpty(lockedId) &&
+            DateTimeOffset.UtcNow.UtcTicks < Interlocked.Read(ref _lockedTargetUntilTicks))
         {
             try
             {
-                var winrtDeviceId = MediaDevice.GetDefaultAudioRenderId(AudioDeviceRole.Default);
-                if (string.IsNullOrWhiteSpace(winrtDeviceId)) return;
+                using var targetDev = controlEnum.GetDevice(lockedId);
+                WriteEndpointVolumeAndMute(targetDev, vol, mute);
+                appliedDeviceId = targetDev.ID;
+            }
+            catch { }
+        }
 
-                var config = SpatialAudioDeviceConfiguration.GetForDeviceId(winrtDeviceId);
-                if (config is null) return;
-
-                config.SetDefaultSpatialAudioFormatAsync(subtype ?? string.Empty).AsTask().GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
+        try
+        {
+            using var def = controlEnum.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            if (!string.Equals(def.ID, appliedDeviceId, StringComparison.OrdinalIgnoreCase))
             {
-                _log($"切换空间音效失败：{ex.Message}");
+                WriteEndpointVolumeAndMute(def, vol, mute);
             }
-            finally
-            {
-                RefreshSpatialOnWorker();
-                CacheUpdated?.Invoke();
-            }
-        });
+        }
+        catch { }
     }
 
-    private void EnqueueWork(Action action)
+    private static void WriteEndpointVolumeAndMute(MMDevice dev, int? vol, bool? mute)
     {
-        if (_disposed) return;
-        try { _workQueue.Add(action); } catch { }
+        var ep = dev.AudioEndpointVolume;
+        if (vol.HasValue)
+        {
+            ep.MasterVolumeLevelScalar = vol.Value / 100f;
+            if (vol.Value > 0 && mute != true && ep.Mute)
+            {
+                ep.Mute = false;
+            }
+        }
+        if (mute.HasValue)
+        {
+            ep.Mute = mute.Value;
+        }
+    }
+
+    private void ApplySessionControlsImmediate(MMDeviceEnumerator controlEnum)
+    {
+        var vols = new Dictionary<int, float>();
+        foreach (var kv in _pendingSessionVolumes)
+        {
+            if (_pendingSessionVolumes.TryRemove(kv.Key, out var v))
+                vols[kv.Key] = v;
+        }
+
+        var mutes = new Dictionary<int, bool>();
+        foreach (var kv in _pendingSessionMutes)
+        {
+            if (_pendingSessionMutes.TryRemove(kv.Key, out var m))
+                mutes[kv.Key] = m;
+        }
+
+        if (vols.Count == 0 && mutes.Count == 0) return;
+
+        try
+        {
+            MMDevice? endpoint = null;
+            var lockedId = _lockedTargetDeviceId;
+            if (!string.IsNullOrEmpty(lockedId) &&
+                DateTimeOffset.UtcNow.UtcTicks < Interlocked.Read(ref _lockedTargetUntilTicks))
+            {
+                try { endpoint = controlEnum.GetDevice(lockedId); } catch { }
+            }
+            endpoint ??= controlEnum.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+
+            using (endpoint)
+            {
+                var sessions = endpoint.AudioSessionManager.Sessions;
+                for (int i = 0; i < sessions.Count; i++)
+                {
+                    var s = sessions[i];
+                    int pid = s.IsSystemSoundsSession ? 0 : (int)s.GetProcessID;
+                    if (!s.IsSystemSoundsSession && pid <= 0) continue;
+
+                    if (vols.TryGetValue(pid, out float targetVol))
+                    {
+                        try { s.SimpleAudioVolume.Volume = targetVol; } catch { }
+                    }
+                    if (mutes.TryGetValue(pid, out bool targetMute))
+                    {
+                        try { s.SimpleAudioVolume.Mute = targetMute; } catch { }
+                    }
+                }
+            }
+        }
+        catch { }
     }
 
     private void AudioWorkerLoop()
@@ -352,11 +561,14 @@ public sealed class AudioDeviceService : IDisposable
             _notifyClient = new DeviceNotificationClient(this);
 
             // 启动预热所有缓存
-            RefreshAllOnWorker();
+            RefreshDevicesOnWorker();
             foreach (var d in _cachedDevices)
             {
                 _knownActiveDeviceIds.Add(d.Id);
             }
+            RefreshMixerOnWorker();
+            RefreshSpatialOnWorker(force: true);
+            CacheUpdated?.Invoke();
 
             try
             {
@@ -369,11 +581,67 @@ public sealed class AudioDeviceService : IDisposable
 
             DevicesChanged?.Invoke();
 
-            foreach (var work in _workQueue.GetConsumingEnumerable())
+            while (!_disposed)
             {
+                _refreshSignal.WaitOne(1000);
                 if (_disposed) break;
-                try { work(); }
-                catch (Exception ex) { _log($"音频工作线程异常：{ex.Message}"); }
+
+                // 若处于设备切换通知风暴防抖窗口内，短暂等待让多次回调自动合并为一次枚举
+                while (!_disposed)
+                {
+                    long notBefore = Interlocked.Read(ref _refreshNotBeforeTicks);
+                    long remainTicks = notBefore - DateTimeOffset.UtcNow.UtcTicks;
+                    if (remainTicks <= 0) break;
+                    int sleepMs = (int)Math.Clamp(remainTicks / TimeSpan.TicksPerMillisecond, 5, 90);
+                    Thread.Sleep(sleepMs);
+                }
+                if (_disposed) break;
+
+                var flags = (RefreshFlags)Interlocked.Exchange(ref _pendingRefreshFlags, 0);
+                if (flags == RefreshFlags.None) continue;
+
+                try
+                {
+                    if ((flags & RefreshFlags.CheckNewlyActive) != 0)
+                    {
+                        ProcessDeviceStateEventsOnWorker();
+                    }
+
+                    bool anyCacheChanged = false;
+                    if ((flags & RefreshFlags.Devices) != 0)
+                    {
+                        if (RefreshDevicesOnWorker())
+                        {
+                            anyCacheChanged = true;
+                        }
+                        DevicesChanged?.Invoke();
+                    }
+
+                    if ((flags & RefreshFlags.Mixer) != 0)
+                    {
+                        if (RefreshMixerOnWorker())
+                        {
+                            anyCacheChanged = true;
+                        }
+                    }
+
+                    if ((flags & RefreshFlags.Spatial) != 0)
+                    {
+                        if (RefreshSpatialOnWorker(force: (flags & RefreshFlags.ForceSpatial) != 0))
+                        {
+                            anyCacheChanged = true;
+                        }
+                    }
+
+                    if (anyCacheChanged)
+                    {
+                        CacheUpdated?.Invoke();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log($"音频枚举工作线程异常：{ex.Message}");
+                }
             }
         }
         catch (Exception ex)
@@ -392,6 +660,37 @@ public sealed class AudioDeviceService : IDisposable
             catch { }
             try { _enumerator?.Dispose(); } catch { }
             _enumerator = null;
+        }
+    }
+
+    private void ProcessDeviceStateEventsOnWorker()
+    {
+        if (_enumerator is null) return;
+        while (_deviceStateEvents.TryDequeue(out var ev))
+        {
+            if (ev.State == DeviceState.Active)
+            {
+                if (_knownActiveDeviceIds.Add(ev.DeviceId))
+                {
+                    try
+                    {
+                        using var dev = _enumerator.GetDevice(ev.DeviceId);
+                        if (dev.DataFlow == DataFlow.Render)
+                        {
+                            var info = BuildDeviceInfo(dev, isDefault: false);
+                            if (info.IsBluetooth && info.Kind == AudioOutputKind.Headphone)
+                            {
+                                BluetoothHeadphonesConnected?.Invoke(info);
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            else
+            {
+                _knownActiveDeviceIds.Remove(ev.DeviceId);
+            }
         }
     }
 
@@ -414,7 +713,16 @@ public sealed class AudioDeviceService : IDisposable
                         activeDevice = null;
                     }
 
-                    activeDevice ??= meterEnum.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                    if (activeDevice is null)
+                    {
+                        var lockedId = _lockedTargetDeviceId;
+                        if (!string.IsNullOrEmpty(lockedId) &&
+                            DateTimeOffset.UtcNow.UtcTicks < Interlocked.Read(ref _lockedTargetUntilTicks))
+                        {
+                            try { activeDevice = meterEnum.GetDevice(lockedId); } catch { }
+                        }
+                        activeDevice ??= meterEnum.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                    }
                     var meter = activeDevice.AudioMeterInformation;
                     float master = Math.Clamp(meter.MasterPeakValue, 0f, 1f);
                     float left = master;
@@ -466,47 +774,44 @@ public sealed class AudioDeviceService : IDisposable
         }
     }
 
-    private void RefreshAllOnWorker()
+    private bool RefreshDevicesOnWorker()
     {
-        if (_disposed || _enumerator is null) return;
-        RefreshDevicesOnWorker();
-        RefreshMixerOnWorker();
-        RefreshSpatialOnWorker();
-        CacheUpdated?.Invoke();
-    }
-
-    private void RefreshDevicesOnWorker()
-    {
-        if (_disposed || _enumerator is null) return;
+        if (_disposed || _enumerator is null) return false;
         var next = QueryOutputDevicesInternal(_enumerator);
         if (!DevicesEqual(_cachedDevices, next))
         {
             _cachedDevices = next;
             Interlocked.Increment(ref _devicesVersion);
+            return true;
         }
+        return false;
     }
 
-    private void RefreshMixerOnWorker()
+    private bool RefreshMixerOnWorker()
     {
-        if (_disposed || _enumerator is null) return;
+        if (_disposed || _enumerator is null) return false;
         var next = QueryVolumeMixerInternal(_enumerator);
         if (!MixersEqual(_cachedMixer, next))
         {
             _cachedMixer = next;
             Interlocked.Increment(ref _mixerVersion);
-            CacheUpdated?.Invoke();
+            return true;
         }
+        return false;
     }
 
-    private void RefreshSpatialOnWorker()
+    private bool RefreshSpatialOnWorker(bool force = false)
     {
-        if (_disposed) return;
-        var next = QuerySpatialSoundInternal();
+        if (_disposed) return false;
+        var next = QuerySpatialSoundInternal(force);
+        if (next is null) return false;
         if (!SpatialsEqual(_cachedSpatial, next))
         {
             _cachedSpatial = next;
             Interlocked.Increment(ref _spatialVersion);
+            return true;
         }
+        return false;
     }
 
     private static bool DevicesEqual(List<AudioDeviceInfo> a, List<AudioDeviceInfo> b)
@@ -621,24 +926,18 @@ public sealed class AudioDeviceService : IDisposable
                 else
                 {
                     displayName = session.DisplayName ?? "";
-                    try
-                    {
-                        using var proc = Process.GetProcessById(pid);
-                        procName = proc.ProcessName;
-                        // 过滤 Windows 音频设备图形隔离系统守护进程 audiodg
-                        if (procName.Equals("audiodg", StringComparison.OrdinalIgnoreCase))
-                        {
-                            continue;
-                        }
-                        try { exePath = proc.MainModule?.FileName; } catch { }
-                        if (string.IsNullOrWhiteSpace(displayName) || displayName.StartsWith("@", StringComparison.Ordinal))
-                        {
-                            displayName = FriendlyProcessName(procName);
-                        }
-                    }
-                    catch
+                    if (!TryResolveProcessMetaFast(pid, out procName, out exePath))
                     {
                         continue;
+                    }
+                    // 过滤 Windows 音频设备图形隔离系统守护进程 audiodg
+                    if (procName.Equals("audiodg", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    if (string.IsNullOrWhiteSpace(displayName) || displayName.StartsWith("@", StringComparison.Ordinal))
+                    {
+                        displayName = FriendlyProcessName(procName);
                     }
                 }
 
@@ -664,9 +963,9 @@ public sealed class AudioDeviceService : IDisposable
                         try
                         {
                             iconBytes = PolicyConfigInterop.ExtractExeIconPngAsync(exePath).GetAwaiter().GetResult();
-                            _mixerIconCache[procName] = iconBytes;
                         }
                         catch { }
+                        _mixerIconCache[procName] = iconBytes;
                     }
                 }
 
@@ -695,13 +994,59 @@ public sealed class AudioDeviceService : IDisposable
             .ToList();
     }
 
-    private List<SpatialSoundOption> QuerySpatialSoundInternal()
+    private bool TryResolveProcessMetaFast(int pid, out string procName, out string? exePath)
+    {
+        var nowTicks = DateTimeOffset.UtcNow.UtcTicks;
+        if (_pidMetaCache.TryGetValue(pid, out var cached) &&
+            (nowTicks - cached.VerifiedAtTicks) < TimeSpan.FromSeconds(10).Ticks)
+        {
+            procName = cached.ProcessName;
+            exePath = cached.ExePath;
+            return true;
+        }
+
+        exePath = PolicyConfigInterop.TryGetProcessImagePath(pid);
+        if (!string.IsNullOrWhiteSpace(exePath))
+        {
+            procName = Path.GetFileNameWithoutExtension(exePath);
+            if (!string.IsNullOrWhiteSpace(procName))
+            {
+                _pidMetaCache[pid] = new CachedPidMeta(procName, exePath, nowTicks);
+                return true;
+            }
+        }
+
+        try
+        {
+            using var proc = Process.GetProcessById(pid);
+            procName = proc.ProcessName;
+            _pidMetaCache[pid] = new CachedPidMeta(procName, exePath, nowTicks);
+            return true;
+        }
+        catch
+        {
+            _pidMetaCache.TryRemove(pid, out _);
+            procName = "";
+            return false;
+        }
+    }
+
+    private List<SpatialSoundOption>? QuerySpatialSoundInternal(bool force)
     {
         var list = new List<SpatialSoundOption>();
         try
         {
             var winrtDeviceId = MediaDevice.GetDefaultAudioRenderId(AudioDeviceRole.Default);
             if (string.IsNullOrWhiteSpace(winrtDeviceId)) return list;
+
+            // 默认音频设备未变且非强制刷新时，跳过耗时的 Dolby/DTS SpatialAudio COM 查询
+            if (!force &&
+                _cachedSpatial.Count > 0 &&
+                string.Equals(winrtDeviceId, _lastSpatialDeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+            _lastSpatialDeviceId = winrtDeviceId;
 
             var config = SpatialAudioDeviceConfiguration.GetForDeviceId(winrtDeviceId);
             if (config is null) return list;
@@ -848,50 +1193,15 @@ public sealed class AudioDeviceService : IDisposable
     private void OnDeviceStateChangedInternal(string deviceId, DeviceState newState)
     {
         if (_disposed) return;
-
-        EnqueueWork(() =>
-        {
-            if (_disposed || _enumerator is null) return;
-
-            if (newState == DeviceState.Active)
-            {
-                bool isNewlyActive = _knownActiveDeviceIds.Add(deviceId);
-                if (isNewlyActive)
-                {
-                    try
-                    {
-                        using var dev = _enumerator.GetDevice(deviceId);
-                        if (dev.DataFlow == DataFlow.Render)
-                        {
-                            var info = BuildDeviceInfo(dev, isDefault: false);
-                            if (info.IsBluetooth && info.Kind == AudioOutputKind.Headphone)
-                            {
-                                BluetoothHeadphonesConnected?.Invoke(info);
-                            }
-                        }
-                    }
-                    catch { }
-                }
-            }
-            else
-            {
-                _knownActiveDeviceIds.Remove(deviceId);
-            }
-
-            RefreshAllOnWorker();
-            DevicesChanged?.Invoke();
-        });
+        _deviceStateEvents.Enqueue((deviceId, newState));
+        RequestCoalescedRefresh(RefreshFlags.All | RefreshFlags.CheckNewlyActive, debounceMs: 80);
     }
 
     private void OnDefaultDeviceChangedInternal()
     {
         if (_disposed) return;
         _resetMeterFlag = true;
-        EnqueueWork(() =>
-        {
-            RefreshAllOnWorker();
-            DevicesChanged?.Invoke();
-        });
+        RequestCoalescedRefresh(RefreshFlags.All, debounceMs: 70);
     }
 
     private static string FriendlyProcessName(string procName) => procName.ToLowerInvariant() switch
@@ -914,7 +1224,8 @@ public sealed class AudioDeviceService : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        try { _workQueue.CompleteAdding(); } catch { }
+        try { _controlSignal.Set(); } catch { }
+        try { _refreshSignal.Set(); } catch { }
     }
 
     private sealed class DeviceNotificationClient(AudioDeviceService owner) : IMMNotificationClient

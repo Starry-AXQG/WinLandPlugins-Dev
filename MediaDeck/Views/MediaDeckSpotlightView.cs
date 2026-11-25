@@ -119,6 +119,7 @@ public sealed class MediaDeckSpotlightView : UserControl
     private long _renderedSpatialVer = -1;
 
     public event Action<string>? ActivateSourceRequested;
+    public event Action<string>? MinimizeSourceRequested;
     public event Action<string>? PlayPauseRequested;
     public event Action<string>? PreviousRequested;
     public event Action<string>? NextRequested;
@@ -702,6 +703,7 @@ public sealed class MediaDeckSpotlightView : UserControl
                 card = new SpotlightMediaCard(_theme, info.Id, AttachCursorHint, HideHint);
                 card.SetVisualConfig(_visualMode, _contourReactivity, _cursorGlowEnabled, _cursorGlowSize, _cursorGlowOpacity);
                 card.ActivateSourceRequested += id => ActivateSourceRequested?.Invoke(id);
+                card.MinimizeSourceRequested += id => MinimizeSourceRequested?.Invoke(id);
                 card.PlayPauseRequested += id => PlayPauseRequested?.Invoke(id);
                 card.PreviousRequested += id => PreviousRequested?.Invoke(id);
                 card.NextRequested += id => NextRequested?.Invoke(id);

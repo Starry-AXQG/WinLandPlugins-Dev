@@ -162,19 +162,52 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private readonly Grid _expandedLayer;
 
     // ==================== 紧凑态（胶囊形态）控件 ====================
+    private enum CompactDisplayLayout
+    {
+        SingleLine = 0,
+        DualTrack = 1,
+        WrappedTwoLines = 2,
+    }
+
     private readonly Image _compactCoverImg;
     private readonly FontIcon _compactCoverFallback;
     private readonly Grid _compactTextViewport;
     private readonly RectangleGeometry _compactClipGeo = new();
+    private readonly StackPanel _compactSingleHost;
     private readonly TranslateTransform _compactMarqueeTx = new();
     private readonly TextBlock _compactTitle;
+
+    // 胶囊双行模式控件（双轨独立滚动 + 单轨自动双行折行，常驻可视树以遵循 Height+Opacity 变形规范）
+    private readonly StackPanel _compactDualHost;
+    private readonly TranslateTransform _compactDualTx1 = new();
+    private readonly TranslateTransform _compactDualTx2 = new();
+    private readonly TextBlock _compactDualLine1;
+    private readonly TextBlock _compactDualLine2;
+    private readonly TextBlock _compactWrappedTitle;
+
     private readonly Rectangle[] _compactQuietifyBars = new Rectangle[5];
+    private CompactDisplayLayout _compactLayout = CompactDisplayLayout.SingleLine;
+    private bool _compactOnlyTranslation;
+    private bool _compactTwoLines;
     private bool _compactIsLyricMode;
-    private string _lastCompactText = "";
+    private string _lastCompactStateSignature = "";
+    private MediaInstanceInfo? _lastCompactInstance;
+    private LyricTriplet _lastCompactLyrics = new("", "", "", false);
+
     private double _compactTextFullWidth;
     private double _compactMarqueeOffset;
     private double _compactMarqueePauseSec;
     private bool _compactMarqueeResetting;
+
+    private double _compactDual1FullWidth;
+    private double _compactDual1Offset;
+    private double _compactDual1PauseSec;
+    private bool _compactDual1Resetting;
+
+    private double _compactDual2FullWidth;
+    private double _compactDual2Offset;
+    private double _compactDual2PauseSec;
+    private bool _compactDual2Resetting;
 
     // ==================== 展开态顶部栏 ====================
     private readonly Button _sourceBtn;
@@ -193,6 +226,8 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private readonly TextBlock _sourceNameText;
     private readonly TextBlock _lyricPrev;
     private readonly TextBlock _lyricCurr;
+    private readonly TextBlock _lyricCurrRoma;
+    private readonly TextBlock _lyricCurrTrans;
     private readonly TextBlock _lyricNext;
 
     // ==================== 展开态底部：左侧闹钟定时 + 居中播放控制 + 右侧喇叭音量 ====================
@@ -242,6 +277,8 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private readonly Border _hintPill;
     private readonly TextBlock _hintText;
     private readonly DispatcherQueueTimer? _hintDelayTimer;
+    private readonly DispatcherQueueTimer? _sourceClickTimer;
+    private DateTimeOffset _lastSourceClickAt = DateTimeOffset.MinValue;
     private UIElement? _hintTarget;
     private Func<string>? _hintTextProvider;
     private Point _hintPendingPt;
@@ -267,6 +304,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private List<AudioDeviceInfo> _cachedDevices = [];
 
     public event Action? ActivateSourceRequested;
+    public event Action? MinimizeSourceRequested;
     public event Action? PlayPauseRequested;
     public event Action? PreviousRequested;
     public event Action? NextRequested;
@@ -411,6 +449,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Child = new Grid { Children = { _compactCoverFallback, _compactCoverImg } },
         };
 
+        // 1.1 单行胶囊文本宿主（默认字号 12.5pt）
         _compactTitle = new TextBlock
         {
             Text = "声枢 · 暂无媒体",
@@ -422,26 +461,87 @@ public sealed class MediaDeckView : UserControl, IMorphView
             VerticalAlignment = VerticalAlignment.Center,
             RenderTransform = _compactMarqueeTx,
         };
-
-        // 使用横向 StackPanel 承载文本，避免 Grid 将 TextBlock 布局槽硬裁切至视口宽度导致滚动时后半段歌词缺失或字被截半
-        var compactMarqueeHost = new StackPanel
+        _compactSingleHost = new StackPanel
         {
             Orientation = Orientation.Horizontal,
             VerticalAlignment = VerticalAlignment.Center,
             Children = { _compactTitle },
         };
 
+        // 1.2 双行胶囊 · 双轨宿主（缩小字号并充分利用 40px 胶囊上下空间，主副行各自支持超长平滑滚动）
+        _compactDualLine1 = new TextBlock
+        {
+            Text = "",
+            FontSize = 10.8,
+            FontWeight = FontWeights.Medium,
+            Foreground = _textBrush,
+            TextWrapping = TextWrapping.NoWrap,
+            RenderTransform = _compactDualTx1,
+        };
+        _compactDualLine2 = new TextBlock
+        {
+            Text = "",
+            FontSize = 10.0,
+            FontWeight = FontWeights.Normal,
+            Foreground = _mutedBrush,
+            TextWrapping = TextWrapping.NoWrap,
+            RenderTransform = _compactDualTx2,
+        };
+        _compactDualHost = new StackPanel
+        {
+            Spacing = 1,
+            VerticalAlignment = VerticalAlignment.Center,
+            Height = 0,
+            Opacity = 0,
+            Children =
+            {
+                new StackPanel { Orientation = Orientation.Horizontal, Children = { _compactDualLine1 } },
+                new StackPanel { Orientation = Orientation.Horizontal, Children = { _compactDualLine2 } },
+            },
+        };
+
+        // 1.3 双行胶囊 · 长句自动折行宿主（单语长句或仅翻译长句自动分两行完整展示）
+        _compactWrappedTitle = new TextBlock
+        {
+            Text = "",
+            FontSize = 10.8,
+            LineStackingStrategy = LineStackingStrategy.BlockLineHeight,
+            LineHeight = 14.5,
+            FontWeight = FontWeights.Medium,
+            Foreground = _textBrush,
+            TextWrapping = TextWrapping.Wrap,
+            MaxLines = 2,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Height = 0,
+            Opacity = 0,
+        };
+
         _compactTextViewport = new Grid
         {
-            VerticalAlignment = VerticalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Stretch,
             HorizontalAlignment = HorizontalAlignment.Stretch,
             Clip = _compactClipGeo,
-            Children = { compactMarqueeHost },
+            Children = { _compactSingleHost, _compactDualHost, _compactWrappedTitle },
         };
         _compactTextViewport.SizeChanged += (_, e) =>
         {
-            _compactClipGeo.Rect = new Rect(0, -4, Math.Max(0, e.NewSize.Width), CompactHeight + 8);
-            RecalculateCompactMarquee(resetOffset: false);
+            double w = Math.Max(0, e.NewSize.Width);
+            double h = e.NewSize.Height > 0 ? e.NewSize.Height : CompactHeight;
+            _compactClipGeo.Rect = new Rect(0, 0, w, h);
+            if (_compactLayout == CompactDisplayLayout.WrappedTwoLines && w > 0)
+            {
+                _compactWrappedTitle.Width = w;
+            }
+            if (_lastCompactInstance is not null)
+            {
+                ApplyCompactContent(_lastCompactInstance, _lastCompactLyrics);
+            }
+            else
+            {
+                RecalculateCompactMarquee(resetOffset: false);
+            }
         };
 
         // 胶囊右侧：Quietify 5柱动态波形（播放）/ 5点（暂停）SVG 图标
@@ -503,8 +603,41 @@ public sealed class MediaDeckView : UserControl, IMorphView
         var sourceIconInner = new Grid { Children = { _sourceIconFallback, _sourceIconImg } };
         _sourceBtn = CreateInteractiveIconButton(sourceIconInner, 28, 28, cornerRadius: 8, isPrimaryPill: false);
         _sourceBtn.HorizontalAlignment = HorizontalAlignment.Left;
-        _sourceBtn.Click += (_, _) => ActivateSourceRequested?.Invoke();
-        AttachCursorHint(_sourceBtn, () => $"切换至 {_currentSourceName}");
+        _sourceBtn.AddHandler(PointerPressedEvent, new PointerEventHandler((_, e) =>
+        {
+            var props = e.GetCurrentPoint(_sourceBtn).Properties;
+            if (props.IsMiddleButtonPressed || props.PointerUpdateKind == Microsoft.UI.Input.PointerUpdateKind.MiddleButtonPressed)
+            {
+                e.Handled = true;
+                _isPointerDown = false;
+                _sourceClickTimer?.Stop();
+                _lastSourceClickAt = DateTimeOffset.MinValue;
+                MinimizeSourceRequested?.Invoke();
+            }
+        }), handledEventsToo: true);
+        _sourceBtn.Click += (_, _) =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            if ((now - _lastSourceClickAt).TotalMilliseconds <= 280)
+            {
+                _sourceClickTimer?.Stop();
+                _lastSourceClickAt = DateTimeOffset.MinValue;
+                MinimizeSourceRequested?.Invoke();
+                return;
+            }
+
+            _lastSourceClickAt = now;
+            if (_sourceClickTimer is not null)
+            {
+                _sourceClickTimer.Stop();
+                _sourceClickTimer.Start();
+            }
+            else
+            {
+                ActivateSourceRequested?.Invoke();
+            }
+        };
+        AttachCursorHint(_sourceBtn, () => $"切换至 {_currentSourceName}\n若窗口已打开，可双击或中键来收回窗口");
 
         // 2.2 顶部绝对居中：多实例指示点
         _dotsPanel = new StackPanel
@@ -628,7 +761,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         middleLeft.Children.Add(coverBox);
         middleLeft.Children.Add(metaStack);
 
-        // 2.5 中部右侧：居中三行同步歌词
+        // 2.5 中部右侧：居中同步歌词（支持外文音译与翻译副行，严格遵循 Height+Opacity 显隐规范）
         _lyricPrev = new TextBlock
         {
             Text = "",
@@ -636,6 +769,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Foreground = _faintBrush,
             TextAlignment = TextAlignment.Center,
             TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(0, 0, 0, 4),
         };
         _lyricCurr = new TextBlock
         {
@@ -648,6 +782,28 @@ public sealed class MediaDeckView : UserControl, IMorphView
             MaxLines = 2,
             TextTrimming = TextTrimming.CharacterEllipsis,
         };
+        _lyricCurrRoma = new TextBlock
+        {
+            Text = "",
+            FontSize = 11,
+            Foreground = _mutedBrush,
+            TextAlignment = TextAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            MaxLines = 1,
+            Height = 0,
+            Opacity = 0,
+        };
+        _lyricCurrTrans = new TextBlock
+        {
+            Text = "",
+            FontSize = 11.5,
+            Foreground = _mutedBrush,
+            TextAlignment = TextAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            MaxLines = 1,
+            Height = 0,
+            Opacity = 0,
+        };
         _lyricNext = new TextBlock
         {
             Text = "",
@@ -655,13 +811,14 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Foreground = _faintBrush,
             TextAlignment = TextAlignment.Center,
             TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(0, 4, 0, 0),
         };
         var middleRight = new StackPanel
         {
-            Spacing = 5,
+            Spacing = 0,
             VerticalAlignment = VerticalAlignment.Center,
             Padding = new Thickness(12, 0, 4, 0),
-            Children = { _lyricPrev, _lyricCurr, _lyricNext },
+            Children = { _lyricPrev, _lyricCurr, _lyricCurrRoma, _lyricCurrTrans, _lyricNext },
         };
 
         _middleGrid = new Grid
@@ -778,9 +935,8 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _volumeBtn.PointerWheelChanged += OnVolumePointerWheelChanged;
         _volumeBtn.Click += (_, _) =>
         {
-            _currentMasterMuted = !_currentMasterMuted;
-            UpdateVolumeBarVisual(_currentMasterMuted ? 0 : Math.Max(1, _currentVolumePct), _currentMasterMuted);
             MasterMuteToggleRequested?.Invoke();
+            SyncMasterVolumeFromProvider();
         };
         AttachCursorHint(_volumeBtn, () => _currentMasterMuted ? "取消静音" : "静音音量");
 
@@ -1095,6 +1251,19 @@ public sealed class MediaDeckView : UserControl, IMorphView
             _hintDelayTimer.Tick += (_, _) => OnHintDelayElapsed();
         }
 
+        // 左上角来源图标单击/双击区分定时器（双击与中键触发最小化收回窗口，单击激活/闪烁窗口）
+        _sourceClickTimer = DispatcherQueue?.CreateTimer();
+        if (_sourceClickTimer is not null)
+        {
+            _sourceClickTimer.Interval = TimeSpan.FromMilliseconds(220);
+            _sourceClickTimer.IsRepeating = false;
+            _sourceClickTimer.Tick += (_, _) =>
+            {
+                _lastSourceClickAt = DateTimeOffset.MinValue;
+                ActivateSourceRequested?.Invoke();
+            };
+        }
+
         // 30fps 主视觉定时器（驱动极光波浪 / 封面轮廓光 / 胶囊歌词滚动 / 胶囊 Quietify 波形 / 音量条弹出收回动画）
         _auroraTimer = DispatcherQueue?.CreateTimer();
         if (_auroraTimer is not null)
@@ -1109,6 +1278,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         Unloaded += (_, _) =>
         {
             _hintDelayTimer?.Stop();
+            _sourceClickTimer?.Stop();
             HideHint();
             // 仅在真正离开视觉树时停止动画，避免宿主短暂重挂视图导致主视觉循环永久停摆
             if (!IsLoaded)
@@ -1125,6 +1295,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _pageAnimTimer?.Stop();
         _auroraTimer?.Stop();
         _hintDelayTimer?.Stop();
+        _sourceClickTimer?.Stop();
     }
 
     public UIElement View => this;
@@ -1166,6 +1337,12 @@ public sealed class MediaDeckView : UserControl, IMorphView
         }
     }
 
+    public void SetCompactLyricsOptions(bool onlyTranslation, bool allowTwoLines)
+    {
+        _compactOnlyTranslation = onlyTranslation;
+        _compactTwoLines = allowTwoLines;
+    }
+
     public void AnimateToExpanded(TimeSpan duration)
     {
         EnsureAuroraTimerRunning();
@@ -1192,19 +1369,20 @@ public sealed class MediaDeckView : UserControl, IMorphView
         LyricTriplet compactLyrics)
     {
         // 1) 胶囊形态独立刷新：遵循「新旧优先 + 优先展示正在播放的实例」规则
+        _lastCompactInstance = compact;
+        _lastCompactLyrics = compactLyrics;
         if (compact is null)
         {
             _compactIsPlaying = false;
             _lastCompactTrackKey = "";
-            SetCompactText("声枢 · 暂无媒体", isLyric: false);
+            SetCompactSingleLine("声枢 · 暂无媒体", isLyric: false);
             UpdateCompactQuietifyStatic();
             UpdateCompactCoverImage(null);
         }
         else
         {
             _compactIsPlaying = compact.IsPlaying;
-            bool compactHasLyric = compactLyrics.HasSyncedLyrics && !string.IsNullOrWhiteSpace(compactLyrics.Current);
-            SetCompactText(compactHasLyric ? compactLyrics.Current : compact.Title, isLyric: compactHasLyric);
+            ApplyCompactContent(compact, compactLyrics);
             UpdateCompactQuietifyStatic();
             string compactTrackKey = $"{compact.Id}||{compact.Title}||{compact.Artist}";
             bool compactTrackChanged = !string.Equals(_lastCompactTrackKey, compactTrackKey, StringComparison.OrdinalIgnoreCase);
@@ -1226,9 +1404,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             _elapsedText.Text = "00:00";
             _durationText.Text = "00:00";
             UpdateProgressVisual(0);
-            _lyricPrev.Text = "";
-            _lyricCurr.Text = "声枢已就绪";
-            _lyricNext.Text = "";
+            ApplyCardLyrics(new LyricTriplet("", "声枢已就绪", "", false));
             UpdateCoverImage(null);
             UpdateAppIconImage(null);
             RebuildInstanceDots(0, -1);
@@ -1268,13 +1444,41 @@ public sealed class MediaDeckView : UserControl, IMorphView
         }
 
         _currentSelectedIndex = selectedIndex;
-        _lyricPrev.Text = lyrics.Previous;
-        _lyricCurr.Text = lyrics.Current;
-        _lyricNext.Text = lyrics.Next;
+        ApplyCardLyrics(lyrics);
 
         UpdateCoverImage(current.ThumbnailBytes, force: instanceChanged || trackChanged);
         UpdateAppIconImage(current.AppIconBytes, force: instanceChanged);
         RebuildInstanceDots(totalCount, selectedIndex);
+    }
+
+    private void ApplyCardLyrics(LyricTriplet lyrics)
+    {
+        bool hasRoma = !string.IsNullOrWhiteSpace(lyrics.CurrentRomanization);
+        bool hasTrans = !string.IsNullOrWhiteSpace(lyrics.CurrentTranslation);
+        bool hasAnySub = hasRoma || hasTrans;
+        bool hasBothSub = hasRoma && hasTrans;
+
+        // 同时开启音译与翻译且当前行均有值时，收起上一行以保证四行内容完整居中不裁切
+        _lyricPrev.Text = lyrics.Previous;
+        _lyricPrev.Height = hasBothSub ? 0 : double.NaN;
+        _lyricPrev.Opacity = hasBothSub ? 0 : 1;
+        _lyricPrev.Margin = hasBothSub ? new Thickness(0) : new Thickness(0, 0, 0, hasAnySub ? 3 : 5);
+
+        _lyricCurr.Text = lyrics.Current;
+        _lyricCurr.MaxLines = hasAnySub ? 1 : 2;
+
+        _lyricCurrRoma.Text = hasRoma ? lyrics.CurrentRomanization : "";
+        _lyricCurrRoma.Height = hasRoma ? double.NaN : 0;
+        _lyricCurrRoma.Opacity = hasRoma ? 1 : 0;
+        _lyricCurrRoma.Margin = hasRoma ? new Thickness(0, 2, 0, 0) : new Thickness(0);
+
+        _lyricCurrTrans.Text = hasTrans ? lyrics.CurrentTranslation : "";
+        _lyricCurrTrans.Height = hasTrans ? double.NaN : 0;
+        _lyricCurrTrans.Opacity = hasTrans ? 1 : 0;
+        _lyricCurrTrans.Margin = hasTrans ? new Thickness(0, 2, 0, 0) : new Thickness(0);
+
+        _lyricNext.Text = lyrics.Next;
+        _lyricNext.Margin = new Thickness(0, hasAnySub ? 3 : 5, 0, 0);
     }
 
     public void UpdateOutputDevices(IReadOnlyList<AudioDeviceInfo> devices)
@@ -1319,19 +1523,142 @@ public sealed class MediaDeckView : UserControl, IMorphView
         }
     }
 
-    // ==================== 胶囊歌词滚动 & Quietify 5柱/5点图标 ====================
+    // ==================== 胶囊单行/双行歌词排版、跑马灯滚动 & Quietify 5柱/5点图标 ====================
 
-    private void SetCompactText(string text, bool isLyric)
+    private void ApplyCompactContent(MediaInstanceInfo compact, LyricTriplet compactLyrics)
     {
-        bool changed = !string.Equals(_lastCompactText, text, StringComparison.Ordinal) || (_compactIsLyricMode != isLyric);
-        _lastCompactText = text;
-        _compactIsLyricMode = isLyric;
-        _compactTitle.Text = text;
+        bool hasLyric = compactLyrics.HasSyncedLyrics && !string.IsNullOrWhiteSpace(compactLyrics.Current);
+        if (!hasLyric)
+        {
+            SetCompactSingleLine(compact.Title, isLyric: false);
+            return;
+        }
 
+        string orig = compactLyrics.Current;
+        string rawTrans = compactLyrics.RawTranslation;
+
+        // 若开启「胶囊态仅显示歌词翻译」：优先取翻译（即使卡片未勾选翻译也可独立生效；无翻译歌曲自动回退原文）
+        if (_compactOnlyTranslation)
+        {
+            string targetText = !string.IsNullOrWhiteSpace(rawTrans) ? rawTrans : orig;
+            if (_compactTwoLines)
+            {
+                SetCompactWrappedTwoLines(targetText);
+            }
+            else
+            {
+                SetCompactSingleLine(targetText, isLyric: true);
+            }
+            return;
+        }
+
+        // 未开启「仅显示翻译」时：检查是否开启「允许胶囊态双行显示歌词」
+        if (_compactTwoLines)
+        {
+            string subLine = BuildSecondaryCompactTrack(compactLyrics.CurrentRomanization, compactLyrics.CurrentTranslation);
+            if (!string.IsNullOrWhiteSpace(subLine))
+            {
+                // 外文歌曲存在翻译/音译：第 1 行显示原文，第 2 行显示翻译/音译，各自超长平滑滚动
+                SetCompactDualTrackLines(orig, subLine);
+                return;
+            }
+
+            // 单语歌词（如中文歌曲或未勾选翻译/音译）：
+            // 若当前句单行放不下，直接自动折为两行完整展示；若当前句较短且有下一句，则上下双行展示「当前句 + 下一句」
+            double vw = _compactTextViewport.ActualWidth;
+            if (vw > 24 && !string.IsNullOrWhiteSpace(compactLyrics.Next))
+            {
+                _compactDualLine1.Text = orig;
+                _compactDualLine1.Measure(new Size(double.PositiveInfinity, CompactHeight));
+                if (_compactDualLine1.DesiredSize.Width <= vw + 1)
+                {
+                    SetCompactDualTrackLines(orig, compactLyrics.Next);
+                    return;
+                }
+            }
+            SetCompactWrappedTwoLines(orig);
+            return;
+        }
+
+        // 默认单行跑马灯模式
+        string singleLine = !string.IsNullOrWhiteSpace(compactLyrics.CompactLine)
+            ? compactLyrics.CompactLine
+            : orig;
+        SetCompactSingleLine(singleLine, isLyric: true);
+    }
+
+    private static string BuildSecondaryCompactTrack(string roma, string trans)
+    {
+        bool hasRoma = !string.IsNullOrWhiteSpace(roma);
+        bool hasTrans = !string.IsNullOrWhiteSpace(trans);
+        if (hasRoma && hasTrans) return $"{roma} · {trans}";
+        if (hasTrans) return trans;
+        if (hasRoma) return roma;
+        return "";
+    }
+
+    private void SetCompactSingleLine(string text, bool isLyric)
+    {
+        string sig = $"S|{(isLyric ? 1 : 0)}|{text}";
+        bool changed = !string.Equals(_lastCompactStateSignature, sig, StringComparison.Ordinal);
+        _lastCompactStateSignature = sig;
+        _compactLayout = CompactDisplayLayout.SingleLine;
+        _compactIsLyricMode = isLyric;
+
+        _compactSingleHost.Height = double.NaN;
+        _compactSingleHost.Opacity = 1;
+        _compactDualHost.Height = 0;
+        _compactDualHost.Opacity = 0;
+        _compactWrappedTitle.Height = 0;
+        _compactWrappedTitle.Opacity = 0;
+
+        _compactTitle.Text = text;
         if (changed)
         {
             RecalculateCompactMarquee(resetOffset: true);
         }
+    }
+
+    private void SetCompactDualTrackLines(string line1, string line2)
+    {
+        string sig = $"D|{line1}||{line2}";
+        bool changed = !string.Equals(_lastCompactStateSignature, sig, StringComparison.Ordinal);
+        _lastCompactStateSignature = sig;
+        _compactLayout = CompactDisplayLayout.DualTrack;
+        _compactIsLyricMode = true;
+
+        _compactSingleHost.Height = 0;
+        _compactSingleHost.Opacity = 0;
+        _compactDualHost.Height = double.NaN;
+        _compactDualHost.Opacity = 1;
+        _compactWrappedTitle.Height = 0;
+        _compactWrappedTitle.Opacity = 0;
+
+        _compactDualLine1.Text = line1;
+        _compactDualLine2.Text = line2;
+        if (changed)
+        {
+            RecalculateCompactMarquee(resetOffset: true);
+        }
+    }
+
+    private void SetCompactWrappedTwoLines(string text)
+    {
+        string sig = $"W|{text}";
+        _lastCompactStateSignature = sig;
+        _compactLayout = CompactDisplayLayout.WrappedTwoLines;
+        _compactIsLyricMode = true;
+
+        _compactSingleHost.Height = 0;
+        _compactSingleHost.Opacity = 0;
+        _compactDualHost.Height = 0;
+        _compactDualHost.Opacity = 0;
+        _compactWrappedTitle.Height = double.NaN;
+        _compactWrappedTitle.Opacity = 1;
+
+        double vw = _compactTextViewport.ActualWidth;
+        _compactWrappedTitle.Width = vw > 0 ? vw : double.NaN;
+        _compactWrappedTitle.Text = text;
     }
 
     private void RecalculateCompactMarquee(bool resetOffset)
@@ -1343,6 +1670,34 @@ public sealed class MediaDeckView : UserControl, IMorphView
             _compactMarqueePauseSec = 0.85;
             _compactMarqueeResetting = false;
             _compactMarqueeTx.X = 0;
+
+            _compactDual1Offset = 0;
+            _compactDual1PauseSec = 0.85;
+            _compactDual1Resetting = false;
+            _compactDualTx1.X = 0;
+
+            _compactDual2Offset = 0;
+            _compactDual2PauseSec = 0.85;
+            _compactDual2Resetting = false;
+            _compactDualTx2.X = 0;
+        }
+
+        if (_compactLayout == CompactDisplayLayout.DualTrack)
+        {
+            _compactDualLine1.Measure(new Size(double.PositiveInfinity, CompactHeight));
+            _compactDual1FullWidth = Math.Ceiling(_compactDualLine1.DesiredSize.Width);
+            if (vw > 0 && _compactDual1FullWidth <= vw + 2) _compactDualTx1.X = 0;
+
+            _compactDualLine2.Measure(new Size(double.PositiveInfinity, CompactHeight));
+            _compactDual2FullWidth = Math.Ceiling(_compactDualLine2.DesiredSize.Width);
+            if (vw > 0 && _compactDual2FullWidth <= vw + 2) _compactDualTx2.X = 0;
+            return;
+        }
+
+        if (_compactLayout == CompactDisplayLayout.WrappedTwoLines)
+        {
+            if (vw > 0) _compactWrappedTitle.Width = vw;
+            return;
         }
 
         if (!_compactIsLyricMode)
@@ -1356,7 +1711,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             return;
         }
 
-        // 有同步歌词时：解除宽度限制，让横向 StackPanel 按完整文本宽度排版并平滑滚动
+        // 有同步歌词单行模式：解除宽度限制，让横向 StackPanel 按完整文本宽度排版并平滑滚动
         _compactTitle.TextTrimming = TextTrimming.None;
         _compactTitle.Width = double.NaN;
         _compactTitle.MaxWidth = double.PositiveInfinity;
@@ -1366,6 +1721,42 @@ public sealed class MediaDeckView : UserControl, IMorphView
         if (vw > 0 && _compactTextFullWidth <= vw + 2)
         {
             _compactMarqueeTx.X = 0;
+        }
+    }
+
+    private static void StepSingleMarquee(
+        double dt,
+        double vw,
+        double fullWidth,
+        ref double offset,
+        ref double pauseSec,
+        ref bool resetting,
+        TranslateTransform tx)
+    {
+        double overflow = fullWidth - vw;
+        if (vw <= 10 || overflow <= 3) return;
+
+        if (pauseSec > 0)
+        {
+            pauseSec -= dt;
+        }
+        else if (!resetting)
+        {
+            offset += 30.0 * dt;
+            if (offset >= overflow + 10)
+            {
+                offset = overflow + 10;
+                resetting = true;
+                pauseSec = 0.75;
+            }
+            tx.X = -offset;
+        }
+        else
+        {
+            offset = 0;
+            resetting = false;
+            pauseSec = 0.85;
+            tx.X = 0;
         }
     }
 
@@ -1413,31 +1804,35 @@ public sealed class MediaDeckView : UserControl, IMorphView
             if (_compactIsLyricMode)
             {
                 double vw = _compactTextViewport.ActualWidth;
-                double overflow = _compactTextFullWidth - vw;
-                if (vw > 10 && overflow > 3)
+                if (_compactLayout == CompactDisplayLayout.SingleLine)
                 {
-                    if (_compactMarqueePauseSec > 0)
-                    {
-                        _compactMarqueePauseSec -= dt;
-                    }
-                    else if (!_compactMarqueeResetting)
-                    {
-                        _compactMarqueeOffset += 30.0 * dt;
-                        if (_compactMarqueeOffset >= overflow + 10)
-                        {
-                            _compactMarqueeOffset = overflow + 10;
-                            _compactMarqueeResetting = true;
-                            _compactMarqueePauseSec = 0.75;
-                        }
-                        _compactMarqueeTx.X = -_compactMarqueeOffset;
-                    }
-                    else
-                    {
-                        _compactMarqueeOffset = 0;
-                        _compactMarqueeResetting = false;
-                        _compactMarqueePauseSec = 0.85;
-                        _compactMarqueeTx.X = 0;
-                    }
+                    StepSingleMarquee(
+                        dt,
+                        vw,
+                        _compactTextFullWidth,
+                        ref _compactMarqueeOffset,
+                        ref _compactMarqueePauseSec,
+                        ref _compactMarqueeResetting,
+                        _compactMarqueeTx);
+                }
+                else if (_compactLayout == CompactDisplayLayout.DualTrack)
+                {
+                    StepSingleMarquee(
+                        dt,
+                        vw,
+                        _compactDual1FullWidth,
+                        ref _compactDual1Offset,
+                        ref _compactDual1PauseSec,
+                        ref _compactDual1Resetting,
+                        _compactDualTx1);
+                    StepSingleMarquee(
+                        dt,
+                        vw,
+                        _compactDual2FullWidth,
+                        ref _compactDual2Offset,
+                        ref _compactDual2PauseSec,
+                        ref _compactDual2Resetting,
+                        _compactDualTx2);
                 }
             }
 

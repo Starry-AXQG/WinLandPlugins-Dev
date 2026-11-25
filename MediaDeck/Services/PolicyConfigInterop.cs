@@ -187,7 +187,20 @@ internal static class PolicyConfigInterop
     public static bool ActivateWindowHandle(IntPtr hWnd)
     {
         if (hWnd == IntPtr.Zero) return false;
-        return BringWindowToFront(hWnd);
+        return HandleVisibleWindowActivation(hWnd);
+    }
+
+    public static bool MinimizeWindowHandle(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero || !IsWindowVisible(hWnd) || IsIconic(hWnd)) return false;
+        StopFlashWindow(hWnd);
+        bool ok = MinimizeWindow(hWnd);
+        if (_lastActivatedHwnd == hWnd)
+        {
+            _lastActivatedHwnd = IntPtr.Zero;
+            _lastActivatedAt = DateTimeOffset.MinValue;
+        }
+        return ok;
     }
 
     /// <summary>
@@ -312,12 +325,15 @@ internal static class PolicyConfigInterop
         return PostMessage(hwnd, WM_APPCOMMAND, hwnd, lParam);
     }
 
-    // ---- 激活来源程序窗口 & 任务栏/窗口闪烁提醒 ----
+    // ---- 激活来源程序窗口 → 闪烁任务栏图标 → 再次点击最小化 ----
 
     private const int SW_RESTORE = 9;
     private const int SW_SHOW = 5;
+    private const int SW_MINIMIZE = 6;
+    private const uint FLASHW_STOP = 0x00000000;
     private const uint FLASHW_ALL = 0x00000003;
     private const uint FLASHW_TIMERNOFG = 0x0000000C;
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FLASHWINFO
@@ -331,6 +347,43 @@ internal static class PolicyConfigInterop
 
     [DllImport("user32.dll")]
     private static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, char[] lpExeName, ref int lpdwSize);
+
+    /// <summary>
+    /// 轻量获取进程可执行文件完整路径（基于 PROCESS_QUERY_LIMITED_INFORMATION，避免昂贵的 Process.MainModule 模块枚举与权限异常）。
+    /// 若进程已退出或不可访问则返回 null。
+    /// </summary>
+    public static string? TryGetProcessImagePath(int pid)
+    {
+        if (pid <= 0) return null;
+        IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (hProc == IntPtr.Zero) return null;
+        try
+        {
+            var buf = new char[1024];
+            int size = buf.Length;
+            if (QueryFullProcessImageName(hProc, 0, buf, ref size) && size > 0)
+            {
+                return new string(buf, 0, size);
+            }
+            return null;
+        }
+        finally
+        {
+            CloseHandle(hProc);
+        }
+    }
 
     private static IntPtr _lastActivatedHwnd = IntPtr.Zero;
     private static DateTimeOffset _lastActivatedAt = DateTimeOffset.MinValue;
@@ -347,6 +400,61 @@ internal static class PolicyConfigInterop
             dwTimeout = 75,
         };
         FlashWindowEx(ref info);
+    }
+
+    private static void StopFlashWindow(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return;
+        var info = new FLASHWINFO
+        {
+            cbSize = (uint)Marshal.SizeOf<FLASHWINFO>(),
+            hwnd = hWnd,
+            dwFlags = FLASHW_STOP,
+            uCount = 0,
+            dwTimeout = 0,
+        };
+        FlashWindowEx(ref info);
+    }
+
+    public static bool MinimizeWindow(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return false;
+        bool ok = ShowWindowAsync(hWnd, SW_MINIMIZE);
+        if (!ok)
+        {
+            ok = ShowWindow(hWnd, SW_MINIMIZE);
+        }
+        return ok;
+    }
+
+    /// <summary>
+    /// 单击媒体来源图标交互：
+    ///   - 窗口未激活或已最小化 → 恢复并前置激活；
+    ///   - 窗口已处于激活状态 → 再次点击闪烁窗口与任务栏图标提醒（不自动最小化，最小化由双击或鼠标中键独立触发）。
+    /// </summary>
+    private static bool HandleVisibleWindowActivation(IntPtr targetHwnd)
+    {
+        if (targetHwnd == IntPtr.Zero) return false;
+
+        var now = DateTimeOffset.UtcNow;
+        IntPtr currentFg = GetForegroundWindow();
+        bool alreadyActive = !IsIconic(targetHwnd) && IsWindowVisible(targetHwnd) &&
+            (currentFg == targetHwnd ||
+             (targetHwnd == _lastActivatedHwnd && (now - _lastActivatedAt).TotalSeconds < 6));
+
+        if (alreadyActive)
+        {
+            BringWindowToFront(targetHwnd);
+            FlashWindowAndTaskbar(targetHwnd);
+            _lastActivatedHwnd = targetHwnd;
+            _lastActivatedAt = now;
+            return true;
+        }
+
+        bool ok = BringWindowToFront(targetHwnd);
+        _lastActivatedHwnd = targetHwnd;
+        _lastActivatedAt = now;
+        return ok;
     }
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -494,18 +602,18 @@ internal static class PolicyConfigInterop
         return copied > 0 ? new string(buf, 0, copied) : string.Empty;
     }
 
-    public static bool ActivateWindowByProcessIdOrName(
+    private static IntPtr ResolveTargetMainWindows(
         int processId,
         string? hintProcessName,
-        string? displayName = null,
-        string? exePath = null,
-        bool hasAppsFolderEntry = false)
+        string? displayName,
+        out IntPtr fallbackHiddenHwnd,
+        out List<string> candidates)
     {
         IntPtr targetHwnd = IntPtr.Zero;
-        IntPtr fallbackHiddenHwnd = IntPtr.Zero;
+        fallbackHiddenHwnd = IntPtr.Zero;
 
         // 1) 构建所有候选进程名列表（兼容 Zen/Firefox/Spotify/网易云/Edge 等多进程应用）
-        var candidates = new List<string>();
+        candidates = [];
         if (!string.IsNullOrWhiteSpace(hintProcessName))
         {
             candidates.Add(CleanProcessHint(hintProcessName));
@@ -572,27 +680,27 @@ internal static class PolicyConfigInterop
             }
         }
 
-        // 5) 命中可见主窗口：直接激活或闪烁提醒
+        return targetHwnd;
+    }
+
+    public static bool ActivateWindowByProcessIdOrName(
+        int processId,
+        string? hintProcessName,
+        string? displayName = null,
+        string? exePath = null,
+        bool hasAppsFolderEntry = false)
+    {
+        IntPtr targetHwnd = ResolveTargetMainWindows(
+            processId,
+            hintProcessName,
+            displayName,
+            out IntPtr fallbackHiddenHwnd,
+            out var candidates);
+
+        // 5) 命中可见主窗口：单击激活窗口，若已激活则闪烁任务栏图标提醒
         if (targetHwnd != IntPtr.Zero)
         {
-            IntPtr currentFg = GetForegroundWindow();
-            bool alreadyActive = !IsIconic(targetHwnd) && IsWindowVisible(targetHwnd) &&
-                (currentFg == targetHwnd ||
-                 (targetHwnd == _lastActivatedHwnd && (DateTimeOffset.UtcNow - _lastActivatedAt).TotalSeconds < 6));
-
-            if (alreadyActive)
-            {
-                BringWindowToFront(targetHwnd);
-                FlashWindowAndTaskbar(targetHwnd);
-                _lastActivatedHwnd = targetHwnd;
-                _lastActivatedAt = DateTimeOffset.UtcNow;
-                return true;
-            }
-
-            bool ok = BringWindowToFront(targetHwnd);
-            _lastActivatedHwnd = targetHwnd;
-            _lastActivatedAt = DateTimeOffset.UtcNow;
-            return ok;
+            return HandleVisibleWindowActivation(targetHwnd);
         }
 
         // 6) 若只有隐藏主窗口（如最小化到托盘），尝试恢复并校验是否真的变为可见
@@ -609,6 +717,21 @@ internal static class PolicyConfigInterop
 
         // 7) 窗口已被关闭/销毁（或隐藏窗口拒绝直接 ShowWindow）：通过 Shell AppsFolder AUMID 或可执行文件重新拉起/唤醒单实例主窗口
         return TryRelaunchOrActivateApp(hintProcessName, hasAppsFolderEntry, exePath, candidates);
+    }
+
+    /// <summary>双击或鼠标中键媒体来源图标：若目标程序主窗口已打开且未最小化，则将其收回（最小化）。</summary>
+    public static bool MinimizeWindowByProcessIdOrName(
+        int processId,
+        string? hintProcessName,
+        string? displayName = null)
+    {
+        IntPtr targetHwnd = ResolveTargetMainWindows(
+            processId,
+            hintProcessName,
+            displayName,
+            out _,
+            out _);
+        return MinimizeWindowHandle(targetHwnd);
     }
 
     private static bool TryRelaunchOrActivateApp(
@@ -668,7 +791,7 @@ internal static class PolicyConfigInterop
                 {
                     try
                     {
-                        var path = proc.MainModule?.FileName;
+                        var path = TryGetProcessImagePath(proc.Id);
                         if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
                         {
                             return path;

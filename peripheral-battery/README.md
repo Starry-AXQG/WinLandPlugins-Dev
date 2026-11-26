@@ -35,6 +35,7 @@ _下面是两种显示UI的卡片预览_
 | **VXE / ATK** | Mouse 1K Dongle（R1SE+ 等 COMPX 接收器） | `3554:F58E` / `373B:*` | HID `UsagePage 0xFF02, Usage 0x0002`（17 字节 COMPX 协议，ReportId `0x08`：`cmd 0x03` 判在线 + `cmd 0x04` 直读电量/充电/电压） |
 | **MCHOSE 迈从** | G87 V2 等 GLW 方案 2.4G 键盘接收器 | `3837:3033` / `41E4:*` | HID `UsagePage 0x0001, Usage 0x0000`（65 字节 GLW 协议，ReportId `0x00`，`flag 0x55`，`cmd 0x05 getFuncConfig` 直读电量/充电/模式；非 GLW 旧设备回退 HUB 缓存） |
 | **Rapoo 雷柏** | VT9PRO / V2M 4K 及一代 VT/V 全系无线游戏鼠标 | `24AE:1205` / `185A` / `1601` / `1600` / `4405` / `418A` 等 | HID `UsagePage 0xFF00, Usage 0x000E`（32 字节 `0xBA` 协议，`target 0xA5/0xFF`，`cmd 0xAA`：经控制端点 `HidD_SetOutputReport` + `HidD_GetInputReport` 直读电量与充电状态） |
+| **BEITONG 北通** | 鲲鹏70（6D/AI/限定/异环）/ 鲲鹏50 / 鲲鹏40 / 鲲鹏20 / 盘古无线手柄 | `20BC:5174` / `5173` / `5130` / `5160` / `5162` / `5127` / `5128` 等 | HID `UsagePage 0x00FF, Usage 0x0003`（64 字节智控协议，ReportId `0x02`：`0x55 getFWInfo` 判无线在线 `fw_conn` + `0x15 getBaseInfo` 直读精确电量百分比与充电状态） |
 
 _更多设备逐步适配中_
 
@@ -65,7 +66,9 @@ peripheral-battery/
         ├── DeviceSourceRegistry.cs   数据源注册表（按顺序注册 Bluetooth / VXE / MCHOSE 等数据源）
         ├── BluetoothDeviceSource.cs  蓝牙 / BLE 数据源（PnP 电池属性 + WinRT AEP 在线过滤 + CoD 类型识别）
         ├── VxeDeviceSource.cs        VXE / ATK 2.4G 数据源（COMPX 17 字节 HID 协议直读）
-        └── MchoseDeviceSource.cs     MCHOSE 迈从 2.4G 数据源（GLW 65 字节 HID 协议直读 + HUB 缓存兜底）
+        ├── MchoseDeviceSource.cs     MCHOSE 迈从 2.4G 数据源（GLW 65 字节 HID 协议直读 + HUB 缓存兜底）
+        ├── RapooDeviceSource.cs      Rapoo 雷柏 2.4G / 有线数据源（32 字节 0xBA 控制管道协议直读）
+        └── BeitongDeviceSource.cs    BEITONG 北通 2.4G / 有线手柄数据源（64 字节智控协议直读）
 ```
 
 ### 核心数据流与模块协作

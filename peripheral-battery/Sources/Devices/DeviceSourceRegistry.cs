@@ -19,5 +19,6 @@ internal static class DeviceSourceRegistry
         new VxeDeviceSource(),
         new MchoseDeviceSource(),
         new RapooDeviceSource(),
+        new BeitongDeviceSource(),
     };
 }

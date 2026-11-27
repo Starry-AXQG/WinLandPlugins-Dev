@@ -312,6 +312,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
     public event Action<int>? SwitchInstanceRequested;
     public event Action<int>? SelectInstanceRequested;
     public event Action<string>? SwitchOutputDeviceRequested;
+    public event Action? RefreshOutputDevicesRequested;
     public event Action<int>? MasterVolumeChangedRequested;
     public event Action<int>? MasterVolumeStepRequested;
     public event Action? MasterMuteToggleRequested;
@@ -2322,6 +2323,8 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _deviceDropdown.Height = double.NaN;
         _deviceDropdown.Opacity = 1;
         _deviceDropdown.IsHitTestVisible = true;
+        // 展开菜单时同步触发一次后台轻量设备重刷，若有变更会自动热更新当前已打开的下拉列表
+        RefreshOutputDevicesRequested?.Invoke();
     }
 
     private void CloseDeviceDropdown()

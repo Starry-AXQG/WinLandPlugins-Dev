@@ -74,6 +74,9 @@ public sealed class AudioDeviceService : IDisposable
     private static readonly PropertyKey PkeyEndpointFormFactor =
         new(new Guid("1da5d803-d492-4edd-8c23-e0c0ffee7f0e"), 0);
 
+    private static readonly PropertyKey PkeyDeviceFriendlyName =
+        new(new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), 14);
+
     private static readonly PropertyKey PkeyDeviceEnumeratorName =
         new(new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), 24);
 
@@ -103,6 +106,7 @@ public sealed class AudioDeviceService : IDisposable
     // 合并式枚举标记
     private int _pendingRefreshFlags;
     private long _refreshNotBeforeTicks;
+    private long _delayedDeviceRecheckTicks;
     private string? _lastSpatialDeviceId;
 
     // 仅在 _audioThread 上访问的 COM 实例
@@ -225,6 +229,13 @@ public sealed class AudioDeviceService : IDisposable
     {
         if (_disposed) return;
         RequestCoalescedRefresh(RefreshFlags.All | RefreshFlags.ForceSpatial, debounceMs: 0);
+    }
+
+    /// <summary>向后台枚举线程投递轻量输出设备重刷（&lt; 1ms，用于展开菜单/聚光卡时兜底校验）。</summary>
+    public void RequestRefreshDevices()
+    {
+        if (_disposed) return;
+        RequestCoalescedRefresh(RefreshFlags.Devices, debounceMs: 0);
     }
 
     /// <summary>向后台枚举线程投递合并式音量合成器刷新（队列已有待跑任务时自动去重）。</summary>
@@ -553,6 +564,13 @@ public sealed class AudioDeviceService : IDisposable
         catch { }
     }
 
+    private void ScheduleDelayedDeviceRecheck(int delayMs)
+    {
+        if (_disposed) return;
+        long target = DateTimeOffset.UtcNow.AddMilliseconds(delayMs).UtcTicks;
+        Interlocked.Exchange(ref _delayedDeviceRecheckTicks, target);
+    }
+
     private void AudioWorkerLoop()
     {
         try
@@ -560,16 +578,7 @@ public sealed class AudioDeviceService : IDisposable
             _enumerator = new MMDeviceEnumerator();
             _notifyClient = new DeviceNotificationClient(this);
 
-            // 启动预热所有缓存
-            RefreshDevicesOnWorker();
-            foreach (var d in _cachedDevices)
-            {
-                _knownActiveDeviceIds.Add(d.Id);
-            }
-            RefreshMixerOnWorker();
-            RefreshSpatialOnWorker(force: true);
-            CacheUpdated?.Invoke();
-
+            // 1) 最优先注册系统音频端点回调，彻底消除「开机预热合成器/空间音效期间蓝牙耳机完成自动回连被漏掉」的监听盲区
             try
             {
                 _enumerator.RegisterEndpointNotificationCallback(_notifyClient);
@@ -579,12 +588,36 @@ public sealed class AudioDeviceService : IDisposable
                 _log($"注册音频设备热插拔监听失败：{ex.Message}");
             }
 
+            // 2) 首轮枚举输出设备并立即通知 UI，不等耗时的空间音效初始化
+            RefreshDevicesOnWorker();
+            foreach (var d in _cachedDevices)
+            {
+                _knownActiveDeviceIds.Add(d.Id);
+            }
             DevicesChanged?.Invoke();
+
+            // 3) 预热音量合成器与空间音效，随后立即补做一次设备复核 + 安排开机 2.5s 蓝牙握手稳定复核
+            RefreshMixerOnWorker();
+            RefreshSpatialOnWorker(force: true);
+            if (RefreshDevicesOnWorker())
+            {
+                foreach (var d in _cachedDevices) _knownActiveDeviceIds.Add(d.Id);
+                DevicesChanged?.Invoke();
+            }
+            CacheUpdated?.Invoke();
+            ScheduleDelayedDeviceRecheck(2500);
+
+            int idleSeconds = 0;
 
             while (!_disposed)
             {
-                _refreshSignal.WaitOne(1000);
+                bool signaled = _refreshSignal.WaitOne(1000);
                 if (_disposed) break;
+
+                if (!signaled)
+                {
+                    idleSeconds++;
+                }
 
                 // 若处于设备切换通知风暴防抖窗口内，短暂等待让多次回调自动合并为一次枚举
                 while (!_disposed)
@@ -598,6 +631,22 @@ public sealed class AudioDeviceService : IDisposable
                 if (_disposed) break;
 
                 var flags = (RefreshFlags)Interlocked.Exchange(ref _pendingRefreshFlags, 0);
+
+                // 检查是否有到期的蓝牙/驱动延迟稳定复核
+                long delayedAt = Interlocked.Read(ref _delayedDeviceRecheckTicks);
+                if (delayedAt > 0 && DateTimeOffset.UtcNow.UtcTicks >= delayedAt)
+                {
+                    Interlocked.CompareExchange(ref _delayedDeviceRecheckTicks, 0, delayedAt);
+                    flags |= RefreshFlags.Devices | RefreshFlags.CheckNewlyActive;
+                }
+
+                // 每 10 秒低频轻量自愈巡检一次设备列表（耗时 < 0.5ms，列表未变零事件开销，彻底兜底开机系统服务慢启动）
+                if (idleSeconds >= 10)
+                {
+                    idleSeconds = 0;
+                    flags |= RefreshFlags.Devices;
+                }
+
                 if (flags == RefreshFlags.None) continue;
 
                 try
@@ -677,7 +726,7 @@ public sealed class AudioDeviceService : IDisposable
                         using var dev = _enumerator.GetDevice(ev.DeviceId);
                         if (dev.DataFlow == DataFlow.Render)
                         {
-                            var info = BuildDeviceInfo(dev, isDefault: false);
+                            var info = BuildDeviceInfo(dev, ev.DeviceId, isDefault: false);
                             if (info.IsBluetooth && info.Kind == AudioOutputKind.Headphone)
                             {
                                 BluetoothHeadphonesConnected?.Invoke(info);
@@ -878,15 +927,25 @@ public sealed class AudioDeviceService : IDisposable
             var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active);
             foreach (var dev in devices)
             {
-                using (dev)
+                try
                 {
-                    list.Add(BuildDeviceInfo(dev, string.Equals(dev.ID, defaultId, StringComparison.OrdinalIgnoreCase)));
+                    using (dev)
+                    {
+                        string id = dev.ID;
+                        list.Add(BuildDeviceInfo(dev, id, string.Equals(id, defaultId, StringComparison.OrdinalIgnoreCase)));
+                    }
+                }
+                catch
+                {
+                    // 单个处于蓝牙握手/驱动初始化瞬态的端点抛异常时隔离跳过，不中断其余设备枚举，并安排延迟复核
+                    ScheduleDelayedDeviceRecheck(800);
                 }
             }
         }
         catch (Exception ex)
         {
             _log($"枚举音频输出设备失败：{ex.Message}");
+            ScheduleDelayedDeviceRecheck(1200);
         }
 
         return list;
@@ -1087,14 +1146,17 @@ public sealed class AudioDeviceService : IDisposable
         return list;
     }
 
-    private AudioDeviceInfo BuildDeviceInfo(MMDevice dev, bool isDefault)
+    private AudioDeviceInfo BuildDeviceInfo(MMDevice dev, string deviceId, bool isDefault)
     {
-        string fullName = dev.FriendlyName;
-        string shortName = fullName;
-        int paren = fullName.IndexOf('(');
-        if (paren > 1)
+        string fullName = "";
+        try
         {
-            shortName = fullName[..paren].Trim();
+            fullName = dev.FriendlyName ?? "";
+        }
+        catch
+        {
+            // 蓝牙端点刚激活但 FriendlyName 属性尚未写入完成，先用兜底名并安排复核
+            ScheduleDelayedDeviceRecheck(800);
         }
 
         bool isHeadphone = false;
@@ -1104,6 +1166,11 @@ public sealed class AudioDeviceService : IDisposable
         try
         {
             var props = dev.Properties;
+            if (string.IsNullOrWhiteSpace(fullName) && props.Contains(PkeyDeviceInterfaceFriendlyName))
+            {
+                fullName = props[PkeyDeviceInterfaceFriendlyName].Value?.ToString() ?? "";
+            }
+
             if (props.Contains(PkeyEndpointFormFactor))
             {
                 var raw = props[PkeyEndpointFormFactor].Value;
@@ -1142,6 +1209,19 @@ public sealed class AudioDeviceService : IDisposable
             }
         }
         catch { }
+
+        if (string.IsNullOrWhiteSpace(fullName))
+        {
+            fullName = isBluetooth ? "蓝牙音频设备" : "音频输出设备";
+            ScheduleDelayedDeviceRecheck(800);
+        }
+
+        string shortName = fullName;
+        int paren = fullName.IndexOf('(');
+        if (paren > 1)
+        {
+            shortName = fullName[..paren].Trim();
+        }
 
         if (!isHeadphone && (
             fullName.Contains("Headphone", StringComparison.OrdinalIgnoreCase) ||
@@ -1182,7 +1262,7 @@ public sealed class AudioDeviceService : IDisposable
             : (isDisplayAudio ? AudioOutputKind.DisplayAudio : AudioOutputKind.Speaker);
 
         return new AudioDeviceInfo(
-            Id: dev.ID,
+            Id: deviceId,
             Name: fullName,
             ShortName: shortName,
             Kind: kind,
@@ -1195,6 +1275,8 @@ public sealed class AudioDeviceService : IDisposable
         if (_disposed) return;
         _deviceStateEvents.Enqueue((deviceId, newState));
         RequestCoalescedRefresh(RefreshFlags.All | RefreshFlags.CheckNewlyActive, debounceMs: 80);
+        // 蓝牙 A2DP/HFP 握手常在状态切换后 300ms~1000ms 才补齐端点与角色，安排一次延迟复核
+        ScheduleDelayedDeviceRecheck(1200);
     }
 
     private void OnDefaultDeviceChangedInternal()
@@ -1202,6 +1284,18 @@ public sealed class AudioDeviceService : IDisposable
         if (_disposed) return;
         _resetMeterFlag = true;
         RequestCoalescedRefresh(RefreshFlags.All, debounceMs: 70);
+        ScheduleDelayedDeviceRecheck(1000);
+    }
+
+    private void OnDevicePropertyChangedInternal(PropertyKey key)
+    {
+        if (_disposed) return;
+        if (key.formatId == PkeyDeviceFriendlyName.formatId ||
+            key.formatId == PkeyDeviceInterfaceFriendlyName.formatId ||
+            key.formatId == PkeyEndpointFormFactor.formatId)
+        {
+            RequestCoalescedRefresh(RefreshFlags.Devices, debounceMs: 220);
+        }
     }
 
     private static string FriendlyProcessName(string procName) => procName.ToLowerInvariant() switch
@@ -1241,12 +1335,13 @@ public sealed class AudioDeviceService : IDisposable
 
         public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId)
         {
-            if (flow == DataFlow.Render && role == Role.Multimedia)
+            if (flow == DataFlow.Render)
             {
                 owner.OnDefaultDeviceChangedInternal();
             }
         }
 
-        public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key) { }
+        public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key)
+            => owner.OnDevicePropertyChangedInternal(key);
     }
 }

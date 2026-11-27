@@ -492,10 +492,12 @@ public sealed class MediaDeckSpotlightView : UserControl
         Loaded += (_, _) =>
         {
             _isLoaded = true;
-            // 每次打开聚光卡都固定显示首页
+            // 每次打开聚光卡都固定显示首页，并后台即时校验一次输出设备与合成器缓存
             ApplyLayoutMode(resetToHomePage: true);
             RenderChangedSectionsFromCache();
             RefreshMediaInstances();
+            _audioService.RequestRefreshDevices();
+            _audioService.RequestRefreshMixer();
             _timer.Start();
             _waveTimer.Start();
             _cardVisualTimer.Start();

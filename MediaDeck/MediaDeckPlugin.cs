@@ -2,6 +2,7 @@ using MediaDeck.Services;
 using MediaDeck.Views;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Documents;
 using Windows.Foundation;
 using Windows.UI;
 using WinIsland.Core;
@@ -829,6 +830,30 @@ public sealed class MediaDeckPlugin : IslandPluginBase
             Duration = TimeSpan.FromSeconds(3),
         });
         panel.Children.Add(testBtBtn);
+
+        var footerNote = new TextBlock
+        {
+            FontSize = 11,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 8, 0, 0),
+        };
+        footerNote.Inlines.Add(new Run
+        {
+            Text = "有任何问题或建议？请访问 ",
+        });
+        var repoLink = new Hyperlink
+        {
+            NavigateUri = new Uri("https://github.com/Starry-AXQG/WinLandPlugins-Dev"),
+            FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+        };
+        repoLink.Inlines.Add(new Run { Text = "项目主页" });
+        footerNote.Inlines.Add(repoLink);
+        footerNote.Inlines.Add(new Run
+        {
+            Text = " 获取帮助。",
+        });
+        panel.Children.Add(footerNote);
 
         return panel;
     }

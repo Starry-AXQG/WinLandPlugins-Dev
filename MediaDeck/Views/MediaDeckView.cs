@@ -1387,8 +1387,9 @@ public sealed class MediaDeckView : UserControl, IMorphView
             UpdateCompactQuietifyStatic();
             string compactTrackKey = $"{compact.Id}||{compact.Title}||{compact.Artist}";
             bool compactTrackChanged = !string.Equals(_lastCompactTrackKey, compactTrackKey, StringComparison.OrdinalIgnoreCase);
+            bool compactCoverChanged = !ReferenceEquals(compact.ThumbnailBytes, _lastCompactCoverBytes);
             _lastCompactTrackKey = compactTrackKey;
-            UpdateCompactCoverImage(compact.ThumbnailBytes, triggerPaletteIfCompact: compactTrackChanged && _progress < 0.5);
+            UpdateCompactCoverImage(compact.ThumbnailBytes, triggerPaletteIfCompact: (compactTrackChanged || compactCoverChanged) && _progress < 0.5);
         }
 
         // 2) 展开卡片形态刷新：遵循卡片当前选中的实例

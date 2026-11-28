@@ -70,6 +70,14 @@ public sealed class MediaSessionService : IDisposable
         public bool WasPlaying { get; set; }
     }
 
+    private sealed record SmtcCachedProps(
+        string Title,
+        string Artist,
+        string Album,
+        byte[]? Thumb,
+        byte[]? SuppressedPrevThumb,
+        DateTimeOffset TrackChangedAt);
+
     private readonly AudioDeviceService _audioService;
     private readonly LyricsService _lyricsService;
     private readonly NetEaseElogService _netEaseElog;
@@ -79,9 +87,10 @@ public sealed class MediaSessionService : IDisposable
     private readonly ConcurrentDictionary<string, ResolvedAppInfo?> _appsFolderCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte[]?> _exeIconCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, FallbackClock> _fallbackClocks = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, (string Title, string Artist, string Album, byte[]? Thumb)> _smtcLastGoodProps = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, SmtcCachedProps> _smtcLastGoodProps = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, (int Pid, string? ExePath, long CachedAtTicks)> _procLookupCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _smtcErrorLogThrottle = new(StringComparer.OrdinalIgnoreCase);
+    private int _coverFollowUpPending;
 
     // 稳定的有序实例表与播放状态记忆
     private readonly List<string> _orderedKeys = [];
@@ -328,9 +337,12 @@ public sealed class MediaSessionService : IDisposable
                 }
             }
 
-            // 清理已消失实例的状态记录
+            // 清理已消失实例的状态记录与 SMTC 封面缓存（杜绝浏览器重启后命中旧进程残留封面）
             var staleKeys = _wasPlayingMap.Keys.Where(k => !snapshotMap.ContainsKey(k)).ToList();
             foreach (var sk in staleKeys) _wasPlayingMap.Remove(sk);
+
+            var staleSmtcKeys = _smtcLastGoodProps.Keys.Where(k => !snapshotMap.ContainsKey(k)).ToList();
+            foreach (var sk in staleSmtcKeys) _smtcLastGoodProps.TryRemove(sk, out _);
 
             // 按 _orderedKeys 组装最终列表
             var orderedList = new List<MediaInstanceInfo>(_orderedKeys.Count);
@@ -667,18 +679,8 @@ public sealed class MediaSessionService : IDisposable
         // 1) 通过 Windows Shell AppsFolder 解析真实应用名与图标（完美支持 Zen/Firefox 哈希 AUMID 和 Spotify Store 版）
         var resolved = await GetOrResolveAppsFolderAsync(appId).ConfigureAwait(false);
 
-        byte[]? thumbBytes = null;
-        // 曲目未发生变化且已有封面字节缓存时直接复用同一 byte[] 引用，避免每 1.5s 重复读流与触发 UI 重复解码/取色
-        if (!string.IsNullOrWhiteSpace(title) &&
-            _smtcLastGoodProps.TryGetValue(stableId, out var sameTrackCached) &&
-            sameTrackCached.Thumb is not null &&
-            string.Equals(sameTrackCached.Title, title, StringComparison.Ordinal) &&
-            string.Equals(sameTrackCached.Artist, artist, StringComparison.Ordinal) &&
-            string.Equals(sameTrackCached.Album, album, StringComparison.Ordinal))
-        {
-            thumbBytes = sameTrackCached.Thumb;
-        }
-        else if (props?.Thumbnail is not null)
+        byte[]? freshThumbBytes = null;
+        if (props?.Thumbnail is not null)
         {
             try
             {
@@ -687,23 +689,83 @@ public sealed class MediaSessionService : IDisposable
                 {
                     var buf = new byte[stream.Size];
                     await stream.ReadAsync(buf.AsBuffer(), (uint)buf.Length, InputStreamOptions.None);
-                    thumbBytes = buf;
+                    freshThumbBytes = buf;
                 }
             }
             catch { }
         }
 
-        // 浏览器 SMTC 偶发瞬态 RPC 失败时保留上一次成功读取的标题/歌手/封面，防止退化为裸浏览器名
+        byte[]? thumbBytes = freshThumbBytes;
+        _smtcLastGoodProps.TryGetValue(stableId, out var prevCached);
+
         if (!string.IsNullOrWhiteSpace(title))
         {
-            _smtcLastGoodProps[stableId] = (title, artist, album, thumbBytes);
+            bool sameTrack = prevCached is not null &&
+                             string.Equals(prevCached.Title, title, StringComparison.Ordinal) &&
+                             string.Equals(prevCached.Artist, artist, StringComparison.Ordinal) &&
+                             string.Equals(prevCached.Album, album, StringComparison.Ordinal);
+
+            DateTimeOffset trackChangedAt = sameTrack
+                ? prevCached!.TrackChangedAt
+                : DateTimeOffset.UtcNow;
+            byte[]? suppressedPrev = sameTrack
+                ? prevCached!.SuppressedPrevThumb
+                : (prevCached?.Thumb ?? prevCached?.SuppressedPrevThumb);
+
+            if (!sameTrack && prevCached is not null)
+            {
+                // 曲目刚发生切换：安排 400ms 后快速追帧，第一时间捕获浏览器异步下载完成的新封面
+                ScheduleCoverFollowUp(400);
+            }
+
+            bool sameNonEmptyAlbum = !string.IsNullOrWhiteSpace(album) &&
+                                     prevCached is not null &&
+                                     string.Equals(prevCached.Album, album, StringComparison.Ordinal);
+
+            // 防串台保护：浏览器（无专辑名或专辑改变）切歌后的前 1.2s 内，若 SMTC 仍返回上一首完全相同的封面字节，判定为旧封面残留并暂予屏蔽
+            if (thumbBytes is not null &&
+                suppressedPrev is not null &&
+                !sameNonEmptyAlbum &&
+                (DateTimeOffset.UtcNow - trackChangedAt).TotalMilliseconds < 1200 &&
+                thumbBytes.AsSpan().SequenceEqual(suppressedPrev))
+            {
+                thumbBytes = null;
+                ScheduleCoverFollowUp(450);
+            }
+            else if (thumbBytes is not null &&
+                     prevCached?.Thumb is not null &&
+                     thumbBytes.AsSpan().SequenceEqual(prevCached.Thumb))
+            {
+                // 字节内容完全一致时复用旧 byte[] 引用，让 UI 侧 ReferenceEquals 零开销命中，同时不阻碍后续真封面到达时自动更新
+                thumbBytes = prevCached.Thumb;
+            }
+            else if (thumbBytes is not null)
+            {
+                // 已拿到全新封面字节，解除上一首残留屏蔽参考
+                suppressedPrev = null;
+            }
+
+            _smtcLastGoodProps[stableId] = new SmtcCachedProps(
+                Title: title,
+                Artist: artist,
+                Album: album,
+                Thumb: thumbBytes,
+                SuppressedPrevThumb: suppressedPrev,
+                TrackChangedAt: trackChangedAt);
         }
-        else if (_smtcLastGoodProps.TryGetValue(stableId, out var cachedProps))
+        else if (prevCached is not null)
         {
-            title = cachedProps.Title;
-            artist = cachedProps.Artist;
-            album = cachedProps.Album;
-            thumbBytes ??= cachedProps.Thumb;
+            // 浏览器 SMTC 偶发瞬态空标题 RPC 抖动时，仅回退保留最近一次有效信息
+            title = prevCached.Title;
+            artist = prevCached.Artist;
+            album = prevCached.Album;
+            if (thumbBytes is not null &&
+                prevCached.Thumb is not null &&
+                thumbBytes.AsSpan().SequenceEqual(prevCached.Thumb))
+            {
+                thumbBytes = prevCached.Thumb;
+            }
+            thumbBytes ??= prevCached.Thumb;
         }
 
         var hint = PolicyConfigInterop.CleanProcessHint(appId);
@@ -843,6 +905,28 @@ public sealed class MediaSessionService : IDisposable
             TimelineUpdatedAt = now,
             AppIconBytes = iconBytes,
         };
+    }
+
+    private void ScheduleCoverFollowUp(int delayMs)
+    {
+        if (_disposed) return;
+        if (Interlocked.CompareExchange(ref _coverFollowUpPending, 1, 0) != 0) return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(delayMs).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _coverFollowUpPending, 0);
+            }
+            if (!_disposed)
+            {
+                await RefreshAsync().ConfigureAwait(false);
+            }
+        });
     }
 
     private async Task<ResolvedAppInfo?> GetOrResolveAppsFolderAsync(string aumid)

@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MediaDeck")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+3aac0af03c1ef128ad470b5e7402f38c7a0848ea")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+13ccc0f84d62da675001890217626718a21da5e3")]
 [assembly: System.Reflection.AssemblyProductAttribute("MediaDeck")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MediaDeck")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

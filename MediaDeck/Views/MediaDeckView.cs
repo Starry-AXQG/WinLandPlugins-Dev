@@ -169,7 +169,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         WrappedTwoLines = 2,
     }
 
-    private readonly Image _compactCoverImg;
+    private readonly Border _compactCoverHost;
     private readonly FontIcon _compactCoverFallback;
     private readonly Grid _compactTextViewport;
     private readonly RectangleGeometry _compactClipGeo = new();
@@ -219,7 +219,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
     private readonly Border _btBadge;
 
     // ==================== 展开态中部 ====================
-    private readonly Image _coverImg;
+    private readonly Border _coverHost;
     private readonly FontIcon _coverFallback;
     private readonly TextBlock _titleText;
     private readonly TextBlock _artistText;
@@ -432,7 +432,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
         _theme.Changed += ApplyThemeColors;
 
         // ==================== 1. 紧凑小岛层（胶囊形态） ====================
-        _compactCoverImg = new Image { Stretch = Stretch.UniformToFill };
+        _compactCoverHost = new Border { CornerRadius = new CornerRadius(6) };
         _compactCoverFallback = new FontIcon
         {
             Glyph = "\uE8D6",
@@ -447,7 +447,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Height = 22,
             CornerRadius = new CornerRadius(6),
             Background = _subtleFillBrush,
-            Child = new Grid { Children = { _compactCoverFallback, _compactCoverImg } },
+            Child = new Grid { Children = { _compactCoverFallback, _compactCoverHost } },
         };
 
         // 1.1 单行胶囊文本宿主（默认字号 12.5pt）
@@ -703,8 +703,8 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Children = { _sourceBtn, dotsHoverHost, _outputBtn },
         };
 
-        // 2.4 中部左侧：专辑封面 + 歌名/歌手/来源名
-        _coverImg = new Image { Stretch = Stretch.UniformToFill };
+        // 2.4 中部左侧：专辑封面（Center Crop 居中裁剪） + 歌名/歌手/来源名
+        _coverHost = new Border { CornerRadius = new CornerRadius(11) };
         _coverFallback = new FontIcon
         {
             Glyph = "\uE8D6",
@@ -721,7 +721,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
             Background = _subtleFillBrush,
             BorderBrush = _subtleBorderBrush,
             BorderThickness = new Thickness(1),
-            Child = new Grid { Children = { _coverFallback, _coverImg } },
+            Child = new Grid { Children = { _coverFallback, _coverHost } },
         };
 
         _titleText = new TextBlock
@@ -2884,7 +2884,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
         if (bytes is null || bytes.Length == 0)
         {
-            _compactCoverImg.Source = null;
+            _compactCoverHost.Background = null;
             _compactCoverFallback.Opacity = 1;
             if (triggerPaletteIfCompact)
             {
@@ -2899,24 +2899,20 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
         try
         {
-            var bmp = await BytesToBitmapAsync(bytes);
+            var (bmp, palette) = await DecodeCenterCroppedCoverAsync(bytes, computePalette: triggerPaletteIfCompact);
             if (ver != _compactCoverLoadVer) return;
-            _compactCoverImg.Source = bmp;
+            _compactCoverHost.Background = CreateCenterCropBrush(bmp);
             _compactCoverFallback.Opacity = 0;
 
-            if (triggerPaletteIfCompact)
+            if (triggerPaletteIfCompact && palette.HasValue && _progress < 0.5)
             {
-                var palette = await ExtractCoverPaletteAsync(bytes);
-                if (ver == _compactCoverLoadVer && _progress < 0.5)
-                {
-                    BeginContourPaletteTransition(palette.Left, palette.Center, palette.Right, allowButtonOrigin: false);
-                }
+                BeginContourPaletteTransition(palette.Value.Left, palette.Value.Center, palette.Value.Right, allowButtonOrigin: false);
             }
         }
         catch
         {
             if (ver != _compactCoverLoadVer) return;
-            _compactCoverImg.Source = null;
+            _compactCoverHost.Background = null;
             _compactCoverFallback.Opacity = 1;
         }
     }
@@ -2929,7 +2925,7 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
         if (bytes is null || bytes.Length == 0)
         {
-            _coverImg.Source = null;
+            _coverHost.Background = null;
             _coverFallback.Opacity = 1;
             BeginContourPaletteTransition(
                 Color.FromArgb(255, 56, 189, 248),
@@ -2941,82 +2937,148 @@ public sealed class MediaDeckView : UserControl, IMorphView
 
         try
         {
-            var bmp = await BytesToBitmapAsync(bytes);
+            var (bmp, palette) = await DecodeCenterCroppedCoverAsync(bytes, computePalette: true);
             if (ver != _coverLoadVer) return;
-            _coverImg.Source = bmp;
+            _coverHost.Background = CreateCenterCropBrush(bmp);
             _coverFallback.Opacity = 0;
 
-            var palette = await ExtractCoverPaletteAsync(bytes);
-            if (ver == _coverLoadVer)
+            if (palette.HasValue)
             {
-                BeginContourPaletteTransition(palette.Left, palette.Center, palette.Right, allowButtonOrigin: _progress >= 0.5);
+                BeginContourPaletteTransition(palette.Value.Left, palette.Value.Center, palette.Value.Right, allowButtonOrigin: _progress >= 0.5);
             }
         }
         catch
         {
             if (ver != _coverLoadVer) return;
-            _coverImg.Source = null;
+            _coverHost.Background = null;
             _coverFallback.Opacity = 1;
         }
     }
 
-    private static async Task<(Color Left, Color Center, Color Right)> ExtractCoverPaletteAsync(byte[] bytes)
+    private static ImageBrush CreateCenterCropBrush(ImageSource source) => new()
     {
-        try
+        ImageSource = source,
+        Stretch = Stretch.UniformToFill,
+        AlignmentX = AlignmentX.Center,
+        AlignmentY = AlignmentY.Center,
+    };
+
+    /// <summary>
+    /// 专辑封面居中裁剪（Center Crop）解码：
+    /// 针对浏览器视频（16:9 / 4:3 / 9:16 等非正方形比例）封面，按短边等比缩放并从正中心裁取 1:1 正方形区域，
+    /// 同时在单次解码内直接完成轮廓光三色提取。
+    /// </summary>
+    internal static async Task<(ImageSource Bitmap, (Color Left, Color Center, Color Right)? Palette)> DecodeCenterCroppedCoverAsync(
+        byte[] bytes,
+        bool computePalette)
+    {
+        using var stream = new InMemoryRandomAccessStream();
+        await stream.WriteAsync(bytes.AsBuffer());
+        stream.Seek(0);
+
+        var decoder = await BitmapDecoder.CreateAsync(stream);
+        uint origW = decoder.PixelWidth;
+        uint origH = decoder.PixelHeight;
+        if (origW == 0 || origH == 0)
         {
-            using var stream = new InMemoryRandomAccessStream();
-            await stream.WriteAsync(bytes.AsBuffer());
             stream.Seek(0);
-
-            var decoder = await BitmapDecoder.CreateAsync(stream);
-            var transform = new BitmapTransform { ScaledWidth = 24, ScaledHeight = 24 };
-            var pixelData = await decoder.GetPixelDataAsync(
-                BitmapPixelFormat.Bgra8,
-                BitmapAlphaMode.Straight,
-                transform,
-                ExifOrientationMode.IgnoreExifOrientation,
-                ColorManagementMode.DoNotColorManage);
-
-            var raw = pixelData.DetachPixelData();
-            long rL = 0, gL = 0, bL = 0, cL = 0;
-            long rC = 0, gC = 0, bC = 0, cC = 0;
-            long rR = 0, gR = 0, bR = 0, cR = 0;
-
-            for (int y = 2; y < 22; y++)
-            {
-                for (int x = 0; x < 24; x++)
-                {
-                    int idx = (y * 24 + x) * 4;
-                    if (idx + 3 >= raw.Length) continue;
-                    byte b = raw[idx];
-                    byte g = raw[idx + 1];
-                    byte r = raw[idx + 2];
-                    byte a = raw[idx + 3];
-                    if (a < 100) continue;
-
-                    int max = Math.Max(r, Math.Max(g, b));
-                    int min = Math.Min(r, Math.Min(g, b));
-                    // 优先采有一定饱和度与亮度的像素
-                    int weight = (max > 35 && max < 245) ? (1 + (max - min) / 16) : 1;
-
-                    if (x < 8) { rL += r * weight; gL += g * weight; bL += b * weight; cL += weight; }
-                    else if (x < 16) { rC += r * weight; gC += g * weight; bC += b * weight; cC += weight; }
-                    else { rR += r * weight; gR += g * weight; bR += b * weight; cR += weight; }
-                }
-            }
-
-            Color colL = cL > 0 ? BoostVibrant((byte)(rL / cL), (byte)(gL / cL), (byte)(bL / cL)) : Color.FromArgb(255, 56, 189, 248);
-            Color colC = cC > 0 ? BoostVibrant((byte)(rC / cC), (byte)(gC / cC), (byte)(bC / cC)) : Color.FromArgb(255, 168, 85, 247);
-            Color colR = cR > 0 ? BoostVibrant((byte)(rR / cR), (byte)(gR / cR), (byte)(bR / cR)) : Color.FromArgb(255, 236, 72, 153);
-            return (colL, colC, colR);
+            var fallback = new BitmapImage();
+            await fallback.SetSourceAsync(stream);
+            return (fallback, computePalette
+                ? (Color.FromArgb(255, 56, 189, 248), Color.FromArgb(255, 168, 85, 247), Color.FromArgb(255, 236, 72, 153))
+                : null);
         }
-        catch
+
+        uint minSide = Math.Min(origW, origH);
+        uint outSide = Math.Clamp(minSide, 1u, 224u);
+        double scale = (double)outSide / minSide;
+        uint scaledW = Math.Max(outSide, (uint)Math.Round(origW * scale));
+        uint scaledH = Math.Max(outSide, (uint)Math.Round(origH * scale));
+        uint cropX = (scaledW - outSide) / 2;
+        uint cropY = (scaledH - outSide) / 2;
+
+        var transform = new BitmapTransform
+        {
+            ScaledWidth = scaledW,
+            ScaledHeight = scaledH,
+            InterpolationMode = BitmapInterpolationMode.Fant,
+            Bounds = new BitmapBounds
+            {
+                X = cropX,
+                Y = cropY,
+                Width = outSide,
+                Height = outSide,
+            },
+        };
+
+        var pixelData = await decoder.GetPixelDataAsync(
+            BitmapPixelFormat.Bgra8,
+            BitmapAlphaMode.Premultiplied,
+            transform,
+            ExifOrientationMode.IgnoreExifOrientation,
+            ColorManagementMode.DoNotColorManage);
+
+        var raw = pixelData.DetachPixelData();
+        var wb = new WriteableBitmap((int)outSide, (int)outSide);
+        using (var dst = wb.PixelBuffer.AsStream())
+        {
+            dst.Write(raw, 0, Math.Min(raw.Length, (int)(outSide * outSide * 4)));
+        }
+        wb.Invalidate();
+
+        (Color Left, Color Center, Color Right)? palette = computePalette
+            ? ComputePaletteFromBgraSquare(raw, (int)outSide)
+            : null;
+        return (wb, palette);
+    }
+
+    private static (Color Left, Color Center, Color Right) ComputePaletteFromBgraSquare(byte[] raw, int side)
+    {
+        if (side <= 0 || raw.Length < 4)
         {
             return (
                 Color.FromArgb(255, 56, 189, 248),
                 Color.FromArgb(255, 168, 85, 247),
                 Color.FromArgb(255, 236, 72, 153));
         }
+
+        long rL = 0, gL = 0, bL = 0, cL = 0;
+        long rC = 0, gC = 0, bC = 0, cC = 0;
+        long rR = 0, gR = 0, bR = 0, cR = 0;
+
+        int step = Math.Max(1, side / 24);
+        int yStart = side / 12;
+        int yEnd = Math.Max(yStart + 1, side - side / 12);
+        int third = Math.Max(1, side / 3);
+        int twoThirds = Math.Max(2, (side * 2) / 3);
+
+        for (int y = yStart; y < yEnd; y += step)
+        {
+            for (int x = 0; x < side; x += step)
+            {
+                int idx = (y * side + x) * 4;
+                if (idx + 3 >= raw.Length) continue;
+                byte a = raw[idx + 3];
+                if (a < 100) continue;
+
+                byte b = a == 255 ? raw[idx] : (byte)Math.Min(255, raw[idx] * 255 / a);
+                byte g = a == 255 ? raw[idx + 1] : (byte)Math.Min(255, raw[idx + 1] * 255 / a);
+                byte r = a == 255 ? raw[idx + 2] : (byte)Math.Min(255, raw[idx + 2] * 255 / a);
+
+                int max = Math.Max(r, Math.Max(g, b));
+                int min = Math.Min(r, Math.Min(g, b));
+                int weight = (max > 35 && max < 245) ? (1 + (max - min) / 16) : 1;
+
+                if (x < third) { rL += r * weight; gL += g * weight; bL += b * weight; cL += weight; }
+                else if (x < twoThirds) { rC += r * weight; gC += g * weight; bC += b * weight; cC += weight; }
+                else { rR += r * weight; gR += g * weight; bR += b * weight; cR += weight; }
+            }
+        }
+
+        Color colL = cL > 0 ? BoostVibrant((byte)(rL / cL), (byte)(gL / cL), (byte)(bL / cL)) : Color.FromArgb(255, 56, 189, 248);
+        Color colC = cC > 0 ? BoostVibrant((byte)(rC / cC), (byte)(gC / cC), (byte)(bC / cC)) : Color.FromArgb(255, 168, 85, 247);
+        Color colR = cR > 0 ? BoostVibrant((byte)(rR / cR), (byte)(gR / cR), (byte)(bR / cR)) : Color.FromArgb(255, 236, 72, 153);
+        return (colL, colC, colR);
     }
 
     private static Color BoostVibrant(byte r, byte g, byte b)

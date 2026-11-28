@@ -128,7 +128,7 @@ public sealed class SpotlightMediaCard : UserControl
     private readonly FontIcon _sourceIconFallback;
     private readonly Border _statusPill;
     private readonly TextBlock _statusPillText;
-    private readonly Image _coverImg;
+    private readonly Border _coverHost;
     private readonly FontIcon _coverFallback;
     private readonly TextBlock _titleText;
     private readonly TextBlock _artistText;
@@ -370,8 +370,8 @@ public sealed class SpotlightMediaCard : UserControl
             Children = { sourceBtn, _statusPill },
         };
 
-        // ==================== 2. 中部：左专辑封面+元信息，右居中三行歌词 ====================
-        _coverImg = new Image { Stretch = Stretch.UniformToFill };
+        // ==================== 2. 中部：左专辑封面（Center Crop 居中裁剪）+ 元信息，右居中同步歌词 ====================
+        _coverHost = new Border { CornerRadius = new CornerRadius(11) };
         _coverFallback = new FontIcon
         {
             Glyph = "\uE8D6",
@@ -388,7 +388,7 @@ public sealed class SpotlightMediaCard : UserControl
             Background = _subtleFillBrush,
             BorderBrush = _subtleBorderBrush,
             BorderThickness = new Thickness(1),
-            Child = new Grid { Children = { _coverFallback, _coverImg } },
+            Child = new Grid { Children = { _coverFallback, _coverHost } },
         };
 
         _titleText = new TextBlock
@@ -1278,7 +1278,7 @@ public sealed class SpotlightMediaCard : UserControl
 
         if (bytes is null || bytes.Length == 0)
         {
-            _coverImg.Source = null;
+            _coverHost.Background = null;
             _coverFallback.Opacity = 1;
             BeginContourPaletteTransition(
                 Color.FromArgb(255, 56, 189, 248),
@@ -1288,20 +1288,25 @@ public sealed class SpotlightMediaCard : UserControl
         }
         try
         {
-            var bmp = await BytesToBitmapAsync(bytes);
+            var (bmp, palette) = await MediaDeckView.DecodeCenterCroppedCoverAsync(bytes, computePalette: true);
             if (ver != _coverLoadVer) return;
-            _coverImg.Source = bmp;
-            _coverFallback.Opacity = 0;
-            var palette = await ExtractCoverPaletteAsync(bytes);
-            if (ver == _coverLoadVer)
+            _coverHost.Background = new ImageBrush
             {
-                BeginContourPaletteTransition(palette.Left, palette.Center, palette.Right);
+                ImageSource = bmp,
+                Stretch = Stretch.UniformToFill,
+                AlignmentX = AlignmentX.Center,
+                AlignmentY = AlignmentY.Center,
+            };
+            _coverFallback.Opacity = 0;
+            if (palette.HasValue)
+            {
+                BeginContourPaletteTransition(palette.Value.Left, palette.Value.Center, palette.Value.Right);
             }
         }
         catch
         {
             if (ver != _coverLoadVer) return;
-            _coverImg.Source = null;
+            _coverHost.Background = null;
             _coverFallback.Opacity = 1;
         }
     }
